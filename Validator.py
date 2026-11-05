@@ -64,9 +64,9 @@ EVALUATION FRAMEWORK:
    - 'is_query_answered' (IsSup): True ONLY if the retrieved documents fully support the answer. If the answer contains ungrounded guesses or claims not in the context, set False.
 
 3. ROUTING RULES ('next_action'):
-   - 'finish': Choose ONLY if 'is_query_answered' is True and an answer exists. NEVER finish if no retrieval has taken place or if the answer is unsupported.
-   - 'route_to_planning': Default destination for search execution. If retrieved context is missing or incomplete, route here and provide suggested keywords or source ('local_kb' vs 'web').
-   - 'route_to_refinement': Choose if the query is messy, ambiguous, contains conversational fluff, or needs parallel decomposition for independent entities.
+   - 'finish': Choose ONLY if 'is_query_answered' is True AND a valid grounded Final Answer exists. If no context has been retrieved yet, 'finish' is STRICTLY FORBIDDEN!
+   - 'route_to_refinement': Choose if the query asks to compare two entities, check if they share a trait, contains 'and' / 'both' / 'same', or is conversational/ambiguous.
+   - 'route_to_planning': Choose for direct factual queries ready for search execution.
 
 CRITICAL INSTRUCTION: Output a RAW JSON tool call matching ValidatorDecision. Do not output conversational text outside the JSON."""
 
@@ -219,10 +219,15 @@ Evaluate the state and issue your ValidatorDecision JSON."""
             print("      [SELF-RAG VETO] Risposta non supportata dal contesto (IsSup=False). Reindirizzo al Planner!")
             act = "route_to_planning"
 
-        # 2. Se non è mai stato fatto planning, non si può terminare
+        # 2. Se non è mai stato fatto planning e la risposta è assente o vuota, non si può terminare
         if act == "finish" and num_plan == 0:
-            print("      [VALIDATOR VETO] Impossibile terminare senza retrieval. Instradamento al Planner.")
-            act = "route_to_planning"
+            is_composite = any(w in q.lower() for w in [" and ", "both", "same", "compare", "differ"]) or decision_obj.query_complexity == "complex"
+            if is_composite and num_ref == 0:
+                print("      [VALIDATOR VETO] Query comparativa/complessa non ancora raffinata. Instradamento al Refiner.")
+                act = "route_to_refinement"
+            else:
+                print("      [VALIDATOR VETO] Impossibile terminare senza retrieval. Instradamento al Planner.")
+                act = "route_to_planning"
 
         # 3. Limiti massimi di sicurezza per prevenire cicli infiniti
         if act == "route_to_refinement" and num_ref >= MAX_REFINEMENT:
