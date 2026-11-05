@@ -27,6 +27,56 @@ DEFAULT_TEMPERATURE = float(os.getenv("TEMPERATURE", "0.3"))
 
 _cached_llm = None
 
+def _preload_cuda_libraries():
+    """
+    Risolve il problema di linking dinamico su Linux / Google Colab (libcudart.so.12 / libcublas.so.12)
+    precaricando le librerie condivise di runtime nella tabella globale con ctypes.RTLD_GLOBAL.
+    """
+    import sys
+    if not sys.platform.startswith("linux"):
+        return
+
+    import os, glob, ctypes
+
+    search_dirs = []
+    # 1. Pacchetti Python nvidia.* installati con pip
+    try:
+        import nvidia.cuda_runtime
+        search_dirs.append(os.path.join(nvidia.cuda_runtime.__path__[0], "lib"))
+    except Exception:
+        pass
+        
+    try:
+        import nvidia.cublas
+        search_dirs.append(os.path.join(nvidia.cublas.__path__[0], "lib"))
+    except Exception:
+        pass
+
+    # 2. Percorsi standard CUDA di Linux / Google Colab
+    search_dirs.extend([
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda-12/lib64",
+        "/usr/lib/x86_64-linux-gnu"
+    ])
+    search_dirs.extend(glob.glob("/usr/local/cuda-12.*/lib64"))
+
+    targets = ["libcublasLt.so.12", "libcublas.so.12", "libcudart.so.12"]
+    loaded = []
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        for target in targets:
+            fpath = os.path.join(d, target)
+            if os.path.exists(fpath) and target not in loaded:
+                try:
+                    ctypes.CDLL(fpath, mode=ctypes.RTLD_GLOBAL)
+                    loaded.append(target)
+                except Exception:
+                    pass
+
+    if loaded:
+        print(f"[INIT] Librerie CUDA precaricate con successo: {', '.join(loaded)}")
+
 def get_llama_model(model_path: Optional[str] = None, temperature: float = DEFAULT_TEMPERATURE):
     """
     Inizializza e restituisce un'istanza singleton del modello LLM.
@@ -36,6 +86,8 @@ def get_llama_model(model_path: Optional[str] = None, temperature: float = DEFAU
     if _cached_llm is not None:
         return _cached_llm
         
+    _preload_cuda_libraries()
+
     target_path = model_path or LOCAL_PATH
     
     # Se il file locale non esiste, scarica da Hugging Face Hub
