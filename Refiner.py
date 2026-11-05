@@ -86,7 +86,7 @@ def refiner_node(state: GraphState, llm) -> dict:
 - Query2doc (Wang et al., 2023) via 'expand_query'
 
 CORE OPERATIONAL RULES:
-1. PRESERVE ENTITIES: Never delete or generalize named entities from the original query (e.g. keep "Scott Derrickson", never replace with generic terms).
+1. PRESERVE ENTITIES: Never delete or generalize named entities from the original query (e.g. keep explicit names like "Marie Curie", never replace with generic terms).
 2. DECOMPOSITION: If the question asks to compare two entities, check a shared property, or involves multiple independent lookups, use 'decompose_query' to create clean sub-questions.
 3. ATOMIC QUESTIONS: If a query is already simple and focused on a single entity, call 'keep_query_unchanged'.
 4. NOISE REMOVAL: If conversational fluff is present, call 'rewrite_query'.

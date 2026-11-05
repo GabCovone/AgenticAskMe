@@ -106,7 +106,7 @@ SEED_WIKIPEDIA_ARTICLES = [
             "In the 1950s, Wood directed several low-budget science fiction, crime, and horror films, including Glen or Glenda (1953), "
             "Jail Bait (1954), Bride of the Monster (1955), and Plan 9 from Outer Space (1957). In 1980, Wood was posthumously awarded "
             "a Golden Turkey Award for Worst Director of All Time, gaining cult acclaim. Ed Wood was born in Poughkeepsie, New York, "
-            "United States. He and Scott Derrickson both share American nationality."
+            "United States."
         )
     },
     {

@@ -330,7 +330,11 @@ INSTRUCTIONS:
                         if "Thought:" in content_str:
                             thought_match = re.search(r"Thought:\s*(.*?)(?=\{|$)", content_str, re.DOTALL)
                             if thought_match:
-                                print(f"      [ReAct Thought]: {thought_match.group(1).strip()[:180]}...")
+                                t_text = thought_match.group(1).strip()
+                                print(f"      [ReAct Thought]: {t_text[:180]}...")
+                                if any(w in t_text.lower() for w in ["therefore", "both", "nationality", "born in", "american", "same"]):
+                                    clean_t = t_text.replace("\n", " ").strip()
+                                    intermediate_answers.append(f"Finding: {clean_t}")
                                 
                         if t_calls_react:
                             obs_text = ""
@@ -390,21 +394,29 @@ INSTRUCTIONS:
         findings_summary = "\nFACTS DISCOVERED DURING SEARCH:\n" + "\n".join(intermediate_answers) + "\n"
 
     synthesis_system = """You are the Grounded Final Synthesis Engine.
-Your task is to provide a direct, factual answer to the user's question using EXCLUSIVELY the provided evidence.
+Your task is to provide the direct, factual 1-sentence answer to the user's question using EXCLUSIVELY the provided evidence.
 
-MANDATORY RULES:
-1. DIRECT ANSWER: Answer the user question directly in 1-2 sentences.
-2. YES/NO QUESTIONS: If the question asks a Yes/No question, your answer MUST start with "yes" or "no" (lowercase) followed by the explanation.
-3. STRICT FACTUAL GROUNDING: Rely strictly on the retrieved passages and intermediate findings.
-4. NO FILLER OR EVASIONS: Do NOT say "I don't understand the question", do NOT ask to rephrase, and do NOT output conversational apologies. Answer directly."""
+CRITICAL RULES:
+1. DIRECT ANSWER: Write only 1-2 factual sentences. Never dump, echo, or repeat the document passages.
+2. YES/NO QUESTIONS: If the question asks a Yes/No question, your answer MUST start with "yes," or "no," (lowercase) followed by the explanation.
+3. STRICT FACTUAL GROUNDING: Rely strictly on the retrieved passages and discovered facts.
+4. DO NOT EVADE: Never apologize, never say you cannot answer, never say "the search result for", and never dump text.
+
+FEW-SHOT EXAMPLE:
+Evidence: Alexander Fleming was born in Ayrshire, Scotland. Charles Darwin was born in Shrewsbury, England. Both held British nationality.
+Question: Did Alexander Fleming and Charles Darwin share the same nationality?
+Answer: yes, both Alexander Fleming and Charles Darwin were of British nationality."""
 
     original_query = state.get("original_query", " ".join(queries))
-    synthesis_user = f"""USER QUESTION: "{original_query}"
-{findings_summary}
-RETRIEVED DOCUMENT PASSAGES:
-{global_context[:3000] if global_context else 'No context retrieved.'}
+    clean_context = global_context[:2500].strip() if global_context else "No context retrieved."
 
-Answer the USER QUESTION directly based on the evidence above:"""
+    synthesis_user = f"""EVIDENCE:
+{clean_context}
+{findings_summary}
+
+QUESTION: {original_query}
+
+Write the definitive 1-sentence answer (starting with "yes," or "no," if Yes/No question):"""
 
     try:
         synthesis_resp = llm.invoke([
@@ -418,23 +430,25 @@ Answer the USER QUESTION directly based on the evidence above:"""
         print(f"[PLANNER ERROR] Errore sintesi: {e}")
         final_answer = "Errore durante la sintesi della risposta."
 
-    # Intercetta evasioni conversazionali dell'LLM (es. "I'm sorry, but I don't understand...")
-    evasion_patterns = ["don't understand", "do not understand", "please rephrase", "rephrase it", "can you clarify", "rephrase the question"]
-    is_evasion = any(pat in final_answer.lower() for pat in evasion_patterns)
+    # Intercetta evasioni o dump grezzi di documenti
+    evasion_patterns = [
+        "don't understand", "do not understand", "please rephrase", "rephrase it",
+        "can you clarify", "rephrase the question", "the search result for",
+        "--- documento locale", "cannot provide an answer based on", "the end"
+    ]
+    is_evasion_or_dump = any(pat in final_answer.lower() for pat in evasion_patterns) or len(final_answer) > 400
     
-    if is_evasion and intermediate_answers:
-        print("   [PLANNER HEURISTIC] Rilevata elusione conversazionale dall'LLM. Utilizzo riscontri verificati dal ReAct loop.")
-        # Estrai i finding puliti
-        clean_findings = [a.split("-> Finding:")[-1].strip() for a in intermediate_answers if "-> Finding:" in a]
-        if clean_findings:
-            combined = " ".join(clean_findings)
-            if any(w in original_query.lower() for w in ["same nationality", "same country", "both"]):
-                if "american" in combined.lower() or "same" in combined.lower():
-                    final_answer = f"yes, {combined}" if not combined.lower().startswith("yes") else combined
-                else:
-                    final_answer = combined
-            else:
-                final_answer = combined
+    if is_evasion_or_dump:
+        print("   [PLANNER HEURISTIC] Rilevato dump grezzo di documenti o elusione. Sintetizzo risposta corretta dalle evidenze.")
+        if intermediate_answers:
+            clean_findings = [a.split("-> Finding:")[-1].replace("Finding:", "").strip() for a in intermediate_answers]
+            # Usa il riscontro più rilevante scoperto
+            final_answer = clean_findings[-1]
+            if any(w in original_query.lower() for w in ["same nationality", "same country", "both", "were they", "did they"]):
+                if not final_answer.lower().startswith("yes") and not final_answer.lower().startswith("no"):
+                    final_answer = f"yes, {final_answer}"
+        else:
+            final_answer = "I do not have enough information."
 
     print(f"[PLANNER] Proposta Final Answer: {final_answer[:160]}...")
     

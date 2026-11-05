@@ -214,22 +214,28 @@ Evaluate the state and issue your ValidatorDecision JSON."""
         # --- RIGOROSA APPLICAZIONE DEI FRAMEWORK ACCADEMICI SUL ROUTING ---
         act = decision_obj.next_action
 
-        # 1. Regola Self-RAG (IsSup): Se la risposta non è supportata, non può terminare
+        # 1. Regola Adaptive-RAG: Al turno 0 (nessun refinement ancora eseguito),
+        # se la query è comparativa o composita (es. "Were X and Y born in same country?"),
+        # deve essere instradata al Refiner per la scomposizione Least-to-Most (Zhou et al., 2022)
+        if num_ref == 0 and num_plan == 0:
+            is_composite = any(w in q.lower() for w in ["same", "both", "compare", "differ", "opposed to"]) or (" and " in q.lower())
+            if is_composite or decision_obj.query_complexity == "complex":
+                print("      [ADAPTIVE-RAG ROUTING] Rilevata query comparativa/complessa al turno 0. Instradamento al Refiner (Least-to-Most).")
+                act = "route_to_refinement"
+
+        # 2. Regola Self-RAG (IsSup): Se la risposta non è supportata, non può terminare
         if act == "finish" and not decision_obj.is_query_answered and num_plan < MAX_PLANNING:
             print("      [SELF-RAG VETO] Risposta non supportata dal contesto (IsSup=False). Reindirizzo al Planner!")
             act = "route_to_planning"
 
-        # 2. Se non è mai stato fatto planning e la risposta è assente o vuota, non si può terminare
+        # 3. Se non è mai stato fatto planning e la risposta è assente o vuota, non si può terminare
         if act == "finish" and num_plan == 0:
-            is_composite = any(w in q.lower() for w in [" and ", "both", "same", "compare", "differ"]) or decision_obj.query_complexity == "complex"
-            if is_composite and num_ref == 0:
-                print("      [VALIDATOR VETO] Query comparativa/complessa non ancora raffinata. Instradamento al Refiner.")
+            if num_ref == 0:
                 act = "route_to_refinement"
             else:
-                print("      [VALIDATOR VETO] Impossibile terminare senza retrieval. Instradamento al Planner.")
                 act = "route_to_planning"
 
-        # 3. Limiti massimi di sicurezza per prevenire cicli infiniti
+        # 4. Limiti massimi di sicurezza per prevenire cicli infiniti
         if act == "route_to_refinement" and num_ref >= MAX_REFINEMENT:
             print(f"      [LIMIT REACHED] Raggiunto limite refinement ({MAX_REFINEMENT}). Forzo passaggio a planning.")
             act = "route_to_planning"
