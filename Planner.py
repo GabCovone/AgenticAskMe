@@ -261,7 +261,7 @@ def extract_tool_calls(response_msg):
         except Exception:
             pass
     if tool_calls_list:
-        return tool_calls_list
+        return tool_calls_list[:2]
 
     # 3. Text-based sliding-window fallback
     i = 0
@@ -314,7 +314,7 @@ def extract_tool_calls(response_msg):
                     escape = False
         i += 1
         
-    return tool_calls_list
+    return tool_calls_list[:2]
 
 
 # --- PLANNER NODE ---
@@ -356,7 +356,7 @@ def planner_node(state: GraphState, llm) -> dict:
     # Strategy classification LLM
     llm_strategy = llm.bind_tools([AdaptiveStrategy])
 
-    MAX_STEPS_PER_QUERY = 3
+    MAX_STEPS_PER_QUERY = 2
     intermediate_answers: List[str] = []
 
     # --- FASE A: RETRIEVAL INTERATTIVO ---
@@ -484,7 +484,7 @@ INSTRUCTIONS:
                         response_msg = llm_react.invoke(messages)
                         messages.append(response_msg)
                         
-                        t_calls_react = extract_tool_calls(response_msg)
+                        t_calls_react = extract_tool_calls(response_msg)[:1]
                         content_str = getattr(response_msg, "content", "").strip()
                         
                         # Check for Thought
@@ -519,6 +519,8 @@ INSTRUCTIONS:
                                         if "Nessun risultato" not in t_res_web:
                                             t_res = t_res_web
                                     
+                                # Cap observation length to prevent context explosion on 4096-token models
+                                t_res = t_res[:800]
                                 preview = str(t_res)[:150].replace('\n', ' ') + "..."
                                 print(f"         [Observation]: {preview}")
                                 
@@ -535,6 +537,10 @@ INSTRUCTIONS:
                             else:
                                 prompt_next = f"{obs_text}Analyze this observation. If you have the answer, output 'FINAL ANSWER: [answer]'. Otherwise, write a Thought and output another JSON tool call."
                                 messages.append(HumanMessage(content=prompt_next))
+
+                            # Prune conversation history in ReAct loop to prevent 4096 context token limit error
+                            if len(messages) > 6:
+                                messages = [messages[0], messages[1]] + messages[-4:]
                         else:
                             if "FINAL ANSWER:" in content_str:
                                 ans = content_str.split("FINAL ANSWER:")[-1].strip()

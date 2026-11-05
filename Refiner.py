@@ -74,6 +74,21 @@ def keep_query_unchanged(reflection: str, reasoning: str) -> str:
     return "UNCHANGED"
 
 
+def clean_subquery_text(s: str) -> str:
+    """
+    Strips markdown artifacts, numbering, and sub-query labels from generated queries.
+    E.g. '*Sub-query 1:** What is ...?' -> 'What is ...?'
+    """
+    if not isinstance(s, str):
+        s = str(s)
+    s = re.sub(r"^\*+\s*", "", s).strip()
+    s = re.sub(r"^\*?(?:sub-?query|question)\s*\d*\s*[:\*\-]*\s*", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"^\d+[\.\)]\s*", "", s).strip()
+    s = re.sub(r"^[-*]\s*", "", s).strip()
+    s = re.sub(r"\*+$", "", s).strip()
+    return s.strip()
+
+
 def extract_refiner_tool_calls(response_msg, content_resp: str) -> List[Dict[str, Any]]:
     """
     Extracts refiner tool calls via:
@@ -187,7 +202,7 @@ def extract_refiner_tool_calls(response_msg, content_resp: str) -> List[Dict[str
     # 4. Text question extraction fallback (e.g. "1. What is ... ? 2. What is ... ?")
     numbered_questions = re.findall(r"(?:^|\n)\s*(?:\d+[\.\)]|\-|\*)\s*(.*?\?)", content_resp)
     if len(numbered_questions) >= 2:
-        clean_qs = [q.strip() for q in numbered_questions if len(q.strip()) > 5]
+        clean_qs = [clean_subquery_text(q) for q in numbered_questions if len(clean_subquery_text(q)) > 5]
         if clean_qs:
             tool_calls_list.append({
                 "name": "decompose_query",
@@ -371,7 +386,7 @@ Analyze the query and feedback, then issue the appropriate JSON tool call."""
                             except Exception:
                                 raw_subs = [raw_subs]
                     if isinstance(raw_subs, list):
-                        decomposed_queries = [str(s).strip() for s in raw_subs if str(s).strip()]
+                        decomposed_queries = [clean_subquery_text(s) for s in raw_subs if clean_subquery_text(s)]
                         # Verifica che le sotto-query siano realmente atomiche e separate
                         if is_comp and decomposed_queries:
                             is_still_composite = any(
@@ -387,7 +402,7 @@ Analyze the query and feedback, then issue the appropriate JSON tool call."""
                     # Se la sotto-query è già atomica, non riscomporla
                     keep_unchanged = True
             elif t_name == "rewrite_query":
-                rewritten_query = args.get("rewritten_query", args.get("query"))
+                rewritten_query = clean_subquery_text(args.get("rewritten_query", args.get("query", "")))
             elif t_name == "expand_query":
                 expansion_text = args.get("pseudo_document", args.get("expansion", args.get("context")))
             elif t_name == "keep_query_unchanged":
@@ -410,8 +425,11 @@ Analyze the query and feedback, then issue the appropriate JSON tool call."""
                 final_processed_queries.append(rewritten_query.strip())
             elif expansion_text and isinstance(expansion_text, str):
                 final_processed_queries.append(f"{q}\n[Expanded Context]: {expansion_text.strip()}")
-            else:
+            elif keep_unchanged:
                 final_processed_queries.append(q)
+            else:
+                fallback_q = clean_subquery_text(args.get("query", args.get("rewritten_query", q)))
+                final_processed_queries.append(fallback_q if fallback_q else q)
         else:
             final_processed_queries.append(q)
 
@@ -419,7 +437,7 @@ Analyze the query and feedback, then issue the appropriate JSON tool call."""
     seen = set()
     deduped_queries = []
     for sq in final_processed_queries:
-        sq_clean = sq.strip()
+        sq_clean = clean_subquery_text(sq)
         if sq_clean and sq_clean.lower() not in seen:
             seen.add(sq_clean.lower())
             deduped_queries.append(sq_clean)
