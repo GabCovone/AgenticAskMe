@@ -1,10 +1,9 @@
 import os
 import functools
-from typing import TypedDict, List
+from typing import TypedDict, List, Literal, Optional
 from langgraph.graph import StateGraph, START, END
-from typing import Literal
 
-# Definiamo lo stato prima degli import degli agenti per evitare dipendenze circolari
+# --- STATO GLOBALE CONDIVISO DEL GRAFO ---
 class GraphState(TypedDict):
     original_query: str
     current_query: str
@@ -15,48 +14,62 @@ class GraphState(TypedDict):
     feedback_history: List[str]
     final_answer: str
 
-# --- INIZIALIZZAZIONE CENTRALE DEL MODELLO ---
-from huggingface_hub import hf_hub_download
-from langchain_community.chat_models import ChatLlamaCpp 
+# --- CONFIGURAZIONE CENTRALE DEL MODELLO ---
+# Modello predefinito: Mistral-Nemo-Instruct (12B Q5_K_M) per ragionamento avanzato,
+# oppure Gemma-2-9B-it (come citato nel README per hardware con VRAM limitata).
+DEFAULT_REPO_ID = os.getenv("LLM_REPO_ID", "bartowski/Mistral-Nemo-Instruct-2407-GGUF")
+DEFAULT_FILENAME = os.getenv("LLM_FILENAME", "Mistral-Nemo-Instruct-2407-Q5_K_M.gguf")
+LOCAL_DIR = os.getenv("LLM_LOCAL_DIR", "./models")
+LOCAL_PATH = os.path.join(LOCAL_DIR, DEFAULT_FILENAME)
 
-# Modello europeo (Mistral Nemo 12B, eccellente per ragionamento e meno incline alle allucinazioni, ~8.5GB)
-REPO_ID = "bartowski/Mistral-Nemo-Instruct-2407-GGUF" 
-FILENAME = "Mistral-Nemo-Instruct-2407-Q5_K_M.gguf" 
-LOCAL_DIR = "./models"
-LOCAL_PATH = os.path.join(LOCAL_DIR, FILENAME)
+# Temperatura impostata a 0.3 per favorire migliore flessibilità generativa e recupero da errori
+DEFAULT_TEMPERATURE = float(os.getenv("TEMPERATURE", "0.3"))
 
 _cached_llm = None
 
-def get_llama_model():
+def get_llama_model(model_path: Optional[str] = None, temperature: float = DEFAULT_TEMPERATURE):
+    """
+    Inizializza e restituisce un'istanza singleton del modello LLM.
+    Configurato con temperature=0.3 per bilanciare creatività nel refinement e precisione nel JSON parsing.
+    """
     global _cached_llm
     if _cached_llm is not None:
         return _cached_llm
         
-    if not os.path.exists(LOCAL_PATH):
-        print(f"[INIT] Download da HuggingFace in corso...")
+    target_path = model_path or LOCAL_PATH
+    
+    # Se il file locale non esiste, scarica da Hugging Face Hub
+    if not os.path.exists(target_path):
+        from huggingface_hub import hf_hub_download
+        print(f"[INIT] Download del modello GGUF ({DEFAULT_FILENAME}) da HuggingFace...")
         os.makedirs(LOCAL_DIR, exist_ok=True)
-        hf_hub_download(repo_id=REPO_ID, filename=FILENAME, local_dir=LOCAL_DIR)
+        hf_hub_download(repo_id=DEFAULT_REPO_ID, filename=DEFAULT_FILENAME, local_dir=LOCAL_DIR)
         
-    print("[INIT] Caricamento del modello in graph.py...")
-    _cached_llm = ChatLlamaCpp(
-        model_path=LOCAL_PATH,
-        n_gpu_layers=-1,      
-        n_ctx=4096,           
-        temperature=0.1,      
-        max_tokens=2048,
-        repeat_penalty=1.15,
-        verbose=False
-    )
-    return _cached_llm
+    print(f"[INIT] Caricamento del modello GGUF in memoria (temperature={temperature})...")
+    try:
+        from langchain_community.chat_models import ChatLlamaCpp
+        _cached_llm = ChatLlamaCpp(
+            model_path=target_path,
+            n_gpu_layers=-1,      # Offload completo su GPU (es. CUDA su Google Colab)
+            n_ctx=4096,           # Finestra di contesto ampia per RAG multi-hop
+            temperature=temperature,  # 0.3 per evitare collasso deterministico
+            max_tokens=2048,
+            repeat_penalty=1.15,
+            verbose=False
+        )
+        return _cached_llm
+    except ImportError as e:
+        print(f"[INIT WARNING] llama-cpp-python non disponibile nell'ambiente locale: {e}")
+        raise
 
-# Importiamo i nodi dopo aver definito lo stato
+# Import dei nodi dopo la definizione di GraphState
 from Validator import validator_node
 from Refiner import refiner_node
 from Planner import planner_node
 
-# --- FUNZIONE DI ROUTING CONDIZIONALE ---
+# --- ROUTER CONDIZIONALE ---
 def route_after_validator(state: GraphState) -> Literal["refinement_node", "planning_node", "__end__"]:
-    """Legge lo stato aggiornato dal validatore e decide il prossimo nodo."""
+    """Legge lo stato aggiornato dal validatore e instrada al nodo successivo."""
     next_action = state.get("next_node")
     if next_action == "route_to_refinement":
         return "refinement_node"
@@ -65,23 +78,25 @@ def route_after_validator(state: GraphState) -> Literal["refinement_node", "plan
     else:
         return END
 
-# --- COSTRUZIONE DEL GRAFO ---
-def build_graph():
-    # 1. Istanziamo il modello una volta sola
-    shared_llm = get_llama_model()
+# --- COSTRUZIONE DEL GRAFO LANGGRAPH ---
+def build_graph(llm_instance=None):
+    """
+    Costruisce e compila il grafo di orchestrazione LangGraph.
+    Se llm_instance non è fornito, richiama get_llama_model().
+    """
+    shared_llm = llm_instance if llm_instance is not None else get_llama_model()
 
-    # 2. Inizializziamo il grafo passando la struttura dello Stato
     workflow = StateGraph(GraphState)
 
-    # 3. Aggiungiamo i nodi al grafo (iniettando shared_llm con functools.partial)
+    # Nodi principali con iniezione del modello condiviso
     workflow.add_node("validator_node", functools.partial(validator_node, llm=shared_llm))
     workflow.add_node("refinement_node", functools.partial(refiner_node, llm=shared_llm))
     workflow.add_node("planning_node", functools.partial(planner_node, llm=shared_llm))
 
-    # Definiamo il punto di partenza
+    # Punto di ingresso: il flusso inizia sempre dal validatore
     workflow.add_edge(START, "validator_node")
 
-    # Aggiungiamo i bordi condizionali in uscita dal validatore
+    # Routing condizionale dal validatore
     workflow.add_conditional_edges(
         "validator_node",
         route_after_validator,
@@ -92,34 +107,12 @@ def build_graph():
         }
     )
 
-    # Dopo il refinement, si torna SEMPRE al validatore per controllare il lavoro
+    # I nodi satellite riportano sempre il controllo al validatore per la chiusura del ciclo
     workflow.add_edge("refinement_node", "validator_node")
-    
-    # Dopo il planning, si torna al validatore per verificare i documenti estratti
     workflow.add_edge("planning_node", "validator_node")
 
-    # Compiliamo il grafo
     app = workflow.compile()
     return app
 
-# --- 4. ESECUZIONE DI TEST ---
 if __name__ == "__main__":
-    app = build_graph()
-    
-    # Input iniziale dell'utente
-    initial_state = {
-        "original_query": "Come funzionano le AI agentiche?",
-        "current_query": "Come funzionano le AI agentiche?",
-        "retrieved_context": "",
-        "num_refinement": 0,
-        "num_planning": 0,
-        "next_node": "",
-        "feedback_history": [],
-        "final_answer": ""
-    }
-
-    print("Grafo compilato con successo! Avvio esecuzione...")
-    
-    for output in app.stream(initial_state, {"recursion_limit": 50}):
-        for key, value in output.items():
-            print(f"\n--- Uscita dal nodo '{key}' ---")
+    print("Modulo graph.py verificato. Eseguire notebook.ipynb o Dashboard.py per avviare il sistema.")

@@ -1,73 +1,134 @@
 # Agentic Information Retrieval (IR) System
 
-This project implements an Agentic Information Retrieval (IR) system based on Large Language Models (LLMs). 
-The goal is to overcome the limitations of traditional unidirectional Retrieval-Augmented Generation (RAG) systems by introducing a cyclical and self-reflexive multi-agent architecture. 
+This project implements an advanced **Agentic Information Retrieval (IR)** system based on Large Language Models (LLMs) and multi-agent orchestration.
+The core goal is to overcome the structural limitations of traditional, unidirectional Retrieval-Augmented Generation (RAG) by introducing a cyclical, self-reflexive, and grounded multi-agent architecture.
 
-The system is able to manage complex information needs, assess the ambiguity of user queries, decompose them, plan multi-step retrieval strategies, and self-correct in the event of missing or contradictory information. Flow orchestration is performed using **LangGraph**, while the agentic logic is entrusted to a **Gemma-2-9B-it** model (quantized for execution on resource-constrained hardware such as Google Colab).
+The system manages complex, multi-hop information needs, evaluates query ambiguity, decomposes questions via Least-to-Most prompting, dynamically selects between a **Local Wikipedia Knowledge Base** and **Live Web Search**, and self-corrects using verbal reflection and critique tokens. Orchestration is powered by **LangGraph**, while inference is optimized for quantized LLMs (e.g. *Mistral-Nemo-Instruct* or *Gemma-2-9B-it*) running on GPU or Google Colab environments.
 
-## System Architecture
+---
 
-The system is based on a global state graph (`GraphState`) shared between three main modules. To optimize performance and reduce computational costs (and network cycles on the main graph), the architecture delegates "micro-reflection" within individual agents, which operate partially autonomously before returning control to the central router. 
+## 🏛️ System Architecture
 
-The flow follows this life cycle: 
-1. **Input**: The user enters the initial query. 
-2. **Routing**: The Validator analyzes the query and decides whether to route it to the Refiner or the Planner. 
-3. **Autonomous Processing**: The designated module executes its task (with possible internal self-criticism loops). 
-4. **Final Evaluation**: Execution returns to the Validator, which judges the results. If the output is satisfactory, the cycle ends; otherwise, it generates textual feedback and triggers a new refinement or planning cycle. 
+The architecture is built upon a cyclic state graph (`GraphState`) shared across three specialized agent modules. To minimize latency and cognitive drift, the system couples module-level autonomy with centralized semantic routing:
 
-## Modules and Academic Foundations 
+```
+                    +------------------------+
+                    |    User Input Query    |
+                    +------------------------+
+                                |
+                                v
+                    +------------------------+ <----------------------+
+                    |     Validator Node     |                        |
+                    | (Adaptive + Self-RAG)  |                        |
+                    +------------------------+                        |
+                      /         |          \                          |
+           (Refine)  /          |           \ (Finish)                |
+                    v           v            v                        |
+             +-----------+ +-----------+  [ END ]                     |
+             |  Refiner  | |  Planner  | (Final Grounded Answer)      |
+             +-----------+ +-----------+                              |
+                    \           /                                     |
+                     +---------+--------------------------------------+
+```
 
-Each module of the system has been designed by implementing specific state-of-the-art (SOTA) theoretical frameworks in the fields of Agentic AI and Natural Language Processing. 
+### Execution Lifecycle:
+1. **Input**: The user inputs a query (factoid, ambiguous, comparison, or multi-hop).
+2. **Routing & Assessment (Validator)**: The Validator performs semantic classification (`query_complexity`), decides whether refinement is required, or routes straight to retrieval planning.
+3. **Autonomous Query Refinement (Refiner)**: Decomposes, rewrites, or semantically expands the query without performing retrieval, preserving explicit named entities.
+4. **Adaptive Retrieval Planning (Planner)**: Classifies the retrieval strategy, dynamically decides between the **Local Wikipedia KB** and **Live Web Search**, and runs an interactive **ReAct** (Reasoning + Acting) loop with observation previews.
+5. **Grounded Synthesis & Quality Critique (Validator)**: The Validator evaluates the proposed answer against the retrieved evidence using explicit Self-RAG critique tokens (`is_context_relevant`, `is_query_answered`). If evidence is missing or hallucinated, it generates verbal critique (`Reflexion`) and redirects the agent.
+
+---
+
+## 📚 Academic Foundations & Literature Mapping
+
+The system directly implements the state-of-the-art (SOTA) frameworks from the literature available in `Paper/`:
+
+| Framework / Paper | Reference | Implementation in Code |
+| :--- | :--- | :--- |
+| **Agentic IR** | Zhang et al. (CIKM '24) & Wu et al. (2025) | Cyclic graph replacing passive one-shot RAG with autonomous reasoning, dynamic tools, and self-evaluation. |
+| **PaperQA** | Lála et al. (2023) | Strict contextual grounding (`Planner.py` synthesis), avoiding hallucinations with explicit "insufficient information" fallbacks. |
+| **Self-RAG** | Asai et al. (ICLR 2024) | Critique tokens `[IsRel]` (`is_context_relevant`) and `[IsSup]` (`is_query_answered`) in `Validator.py` to veto unsupported outputs. |
+| **Reflexion** | Shinn et al. (NeurIPS 2023) | Episodic verbal memory buffer (`feedback_history`) passed across iterations to steer agents away from past failures. |
+| **Least-to-Most Prompting** | Zhou et al. (ICLR 2023) | `decompose_query` tool in `Refiner.py` to break composite or comparison questions into atomic sub-questions. |
+| **Rewrite-Retrieve-Read** | Ma et al. (EMNLP 2023) | `rewrite_query` tool in `Refiner.py` to strip conversational noise and optimize search keywords. |
+| **Query2doc** | Wang et al. (EMNLP 2023) | `expand_query` in `Refiner.py` generating synthetic pseudo-documents to maximize sparse/dense retrieval recall. |
+| **Adaptive-RAG** | Jeong et al. (NAACL 2024) | `AdaptiveStrategy` in `Planner.py` and `query_complexity` in `Validator.py` to adapt retrieval effort to question difficulty. |
+| **ReAct** | Yao et al. (ICLR 2023) | Interleaving reasoning (`Thought:`) with tool calls (`Action:`) and environment data (`Observation:`) in `Planner.py`. |
+| **IRCoT** | Trivedi et al. (ACL 2023) | Interleaving retrieval with Chain-of-Thought, accumulating `global_context` across sub-queries and iterations. |
+| **Self-Ask** | Press et al. (EMNLP 2023) | Follow-up question generation to resolve missing intermediate entities before final synthesis. |
+
+---
+
+## 🧩 Modules in Detail
 
 ### 1. The Validator (`Validator.py`)
-Acts as the Conductor (input router) and Judge (output). It queries the model by imposing a rigorous JSON output schema (`ValidatorDecision`). 
-* **Sliding-Window Try-Parse**: Features a custom, highly robust JSON fallback parser that scans the output independently evaluating every `{`. It provides total immunity to "Ghost Token Hallucinations" and premature JSON block restarts, seamlessly intercepting valid JSONs even when hidden behind corrupted formatting.
-* **Cross-Lingual Guardrails**: System prompts, few-shot examples, and external API calls (e.g. DuckDuckGo region locking) are strictly enforced in English to prevent cross-lingual cognitive load and "Few-Shot Leakage" (lazy copying of examples by the LLM during context confusion).
-* **Logical State Routing**: Implements semantic structural evaluation combined with state-management resets. It correctly distinguishes between independent composite queries (routed to Refiner) and dependent follow-up sub-queries (routed to Planner), while actively preventing infinite ReAct loops by cleaning global state traces (`final_answer` resets) on retrieval failures.
-* **Adaptive-RAG**: The model is forced to explicitly assess the input via a `query_complexity` attribute (simple, complex, already_decomposed), which mathematically dictates the initial routing strategy (Jeong et al., 2024). 
-* **Self-RAG**: After searches are executed, the Validator generates two explicit *Critique Tokens* (`is_context_relevant` and `is_query_answered`) to evaluate whether the extracted documents are semantically relevant and sufficient to logically support the original query (Asai et al., 2023). 
-* **Reflexion**: If the task fails, the Validator leverages a dedicated `reflection` attribute to critique the trajectory (e.g. Planning Count loops) and outputs a textual instruction for the next loop to avoid repeating mistakes (Shinn et al., 2023). 
+Acts as the conductor (input router) and final judge:
+* **Self-RAG Critique Tokens**: Evaluates evidence relevance (`is_context_relevant` [IsRel]) and factual grounding (`is_query_answered` [IsSup]). Vetoes premature termination if the candidate answer contains ungrounded claims.
+* **Reflexion Feedback**: Injects detailed verbal guidance into `feedback_history` upon retrieval failures, prompting the agent to revise search terms.
+* **Sliding-Window Robust JSON Parser**: Resilient parser that scans for nested JSON objects and handles raw string arguments and malformed escapes seamlessly.
 
 ### 2. The Refiner (`Refiner.py`)
-Module responsible for **Autonomous Query Refinement**. It does not perform database searches, but prepares the perfect query via tool-calling. Depending on the problem detected in the input query, the model autonomously chooses which tool to apply (even in parallel). To enforce the **Reflexion** framework, all tools require a mandatory `reflection` parameter where the LLM must critique its past attempts based on the Validator's feedback before acting.
-* **Decomposition Tool**: Implements Least-to-Most Prompting (Zhou et al., 2022) to divide complex queries into logical and sequential sub-problems. 
-* **Rewriting Tool**: Implements the Rewrite-Retrieve-Read framework (Ma et al., 2023) to correct ambiguous or poorly formulated queries. 
-* **Semantic Expansion Tool**: Exploits the Query2doc paradigm (Wang et al., 2023) to generate pseudo-documents or lists of key concepts to be concatenated to the original query, in order to maximize recall in the next vector step.
+Responsible for **Autonomous Query Refinement**:
+* **Decomposition Tool (`decompose_query`)**: Scomposes multi-entity or comparison questions into parallel atomic queries (Least-to-Most).
+* **Rewriting Tool (`rewrite_query`)**: Cleans syntax, resolves noise, and retains explicit named entities (Rewrite-Retrieve-Read).
+* **Semantic Expansion Tool (`expand_query`)**: Synthesizes pseudo-documents to boost retrieval vocabulary (Query2doc).
+* **Atomic Preservation (`keep_query_unchanged`)**: Leaves simple queries intact when no refinement is necessary.
 
 ### 3. The Planner (`Planner.py`)
-The operational heart of the system, responsible for **Multi-Step Retrieval Planning**. It receives queries from the Refiner, classifies the required strategy, and actively accesses external search tools (vector databases, open web via DuckDuckGo). 
-* **Strategic Classification**: It uses Adaptive-RAG (Jeong et al., 2024) again to decide whether the sub-query requires internal knowledge, a single retrieval step, or a multi-step plan. 
-* **Context-Aware Execution (IRCoT)**: During `single_retrieval` and `internal_knowledge`, it explicitly injects the `global_context` of previously answered sub-queries to dynamically resolve missing entities and placeholders (e.g. replacing pronouns with discovered names) before querying the search engine.
-* **Multi-Step ReAct**: Orchestrates data retrieval by intertwining reasoning and action based on the ReAct operation loop (Yao et al., 2022), formulating dynamic follow-ups (Self-Ask) if the retrieved context is missing crucial information.
-* **Transparent Execution Trace**: Fully exposes internal ReAct reasoning thoughts and truncated retrieved document snippets in the terminal, guaranteeing complete observability of the agent's logic and data sources.
+The operational retrieval engine:
+* **Dual-Source Retrieval**:
+  - `local_kb_search`: Searches the local Wikipedia Knowledge Base (SQLite FTS5 + BM25Okapi).
+  - `web_search`: Live search on the open web via DuckDuckGo.
+* **Autonomous Source Decision**: In `AdaptiveStrategy`, the agent evaluates whether the query requires encyclopedic knowledge (`local_kb`), live/recent information (`web`), or both (`both`).
+* **Multi-Step ReAct Loop**: Coordinates search actions, logs intermediate thoughts, and handles observations step-by-step.
+* **Cumulative Context (IRCoT)**: Preserves `global_context` across multi-hop reasoning passes.
 
-## Technology Stack and Setup
-* **Orchestration**: `langgraph` (state management and conditional loops). 
-* **LLM Interaction**: `langchain` (tool binding and structured output). 
-* **Model**: `bartowski/gemma-2-9b-it-GGUF` (Quantization Q4_K_M). 
-* **Inference Engine**: `llama-cpp-python` (compiled with CUDA 12.4+ support for full GPU offload). 
+### 4. Local Wikipedia Knowledge Base (`local_kb.py`)
+* Embedded SQLite database (`wikipedia_local.db`) equipped with **FTS5 full-text indexing** and **BM25Okapi** ranking.
+* Pre-seeded with curated Wikipedia articles spanning Computer Science, AI, Biographies, Science, Geography, Cinema, and Literature.
+* In-memory index caching for sub-millisecond retrieval latency during agentic loops.
+* Extensible via `add_article(title, text, category)` and batch HuggingFace dataset import (`build_index`).
 
-> **Hardware note**: The 9 billion parameter, 4-bit quantized model (approx. 6.5 GB) was selected to fit perfectly within both the VRAM (15 GB) and System RAM (12 GB) limits of the NVIDIA T4 GPU provided by Google's free Colab tier, while providing superior logic and JSON formatting capabilities compared to standard 7B models.
+### 5. Interactive Dashboard (`Dashboard.py`)
+* Streamlit-based web dashboard offering:
+  - Live query testing and execution tracing.
+  - Visualization of Adaptive-RAG decisions and Self-RAG critique tokens.
+  - Direct exploration and search in the local Wikipedia Knowledge Base.
+  - Ingestion tool to add custom Wikipedia articles directly from the UI.
 
-## References 
-The system is based on the following academic studies (sorted by role in the project): 
+---
 
-**Core Literature:**
-1. Zhang, Y. et al. (2024). *AI Agent for Information Retrieval: Generating and Ranking*. CIKM '24 Workshop. 
-2. Wu, Y. et al. (2025). *Agentic Reasoning: Reasoning LLMs with Tools for the Deep Research*. 
-3. Lála, J. et al. (2023). *PaperQA: Retrieval-Augmented Generative Agent for Scientific Research*. 
+## ⚙️ Model Parameters & Temperature Setting
 
-**Routing, Reflection, and Evaluation (Validator):**
-4. Asai, A. et al. (2023). *Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection*. 
-5. Shinn, N. et al. (2023). *Reflexion: Language Agents with Verbal Reinforcement Learning*. 
+* **Default Temperature**: `0.3` (configurable via `TEMPERATURE=0.3`).
+  - *Rationale*: A temperature of `0.1` can cause deterministic mode collapse and rigid query rewriting, hindering recovery when initial searches return zero matches. Setting the temperature to `0.3` provides the required flexibility for creative query expansion and alternative keyword formulation, while maintaining strict JSON structural adherence.
+* **Model Choices**:
+  - `bartowski/Mistral-Nemo-Instruct-2407-GGUF` (Q5_K_M, ~8.5 GB) - High reasoning capability.
+  - `bartowski/gemma-2-9b-it-GGUF` (Q4_K_M, ~6.5 GB) - Fits within free Google Colab T4 GPU (15 GB VRAM).
 
-**Query Refinement and Expansion (Refiner):**
-6. Zhou, D. et al. (2022). *Least-to-Most Prompting Enables Complex Reasoning in Large Language Models*.
-7. Ma, X. et al. (2023). *Query Rewriting for Retrieval-Augmented Large Language Models*.
-8. Wang, L. et al. (2023). *Query2doc: Query Expansion with Large Language Models*.
+---
 
-**Multi-Step Classification and Planning (Planner):**
-9. Jeong, S. et al. (2024). *Adaptive-RAG: Learning to Adapt Retrieval-Augmented Large Language Models through Question Complexity*.
-10. Yao, S. et al. (2022). *ReAct: Synergizing Reasoning and Acting in Language Models*.
-11. Trivedi, H. et al. (2022). *Interleaving Retrieval with Chain-of-Thought Reasoning for Knowledge-Intensive Multi-Step Questions (IRCoT)*.
-12. Press, O. et al. (2022). *Measuring and Narrowing the Compositionality Gap in Language Models (Self-Ask)*.
+## 🚀 Getting Started
+
+### 1. Installation
+```bash
+pip install langchain langgraph langchain-community huggingface-hub pydantic rank_bm25 datasets duckduckgo-search streamlit pandas
+```
+*For GPU acceleration on Google Colab / CUDA:*
+```bash
+pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 -q
+```
+
+### 2. Initialize Local Wikipedia KB
+```bash
+python local_kb.py
+```
+
+### 3. Launch the Interactive Dashboard
+```bash
+streamlit run Dashboard.py
+```
+
+### 4. Run Benchmark in Notebook
+Open and run `notebook.ipynb` in Google Colab or your local Jupyter environment.

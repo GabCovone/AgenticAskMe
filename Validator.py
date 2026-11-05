@@ -1,161 +1,145 @@
+import json
 import os
+import sys
 from typing import Literal
 from pydantic import BaseModel, Field
-from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
-
+from langchain_core.messages import SystemMessage, HumanMessage
 from graph import GraphState
 
-# --- COSTANTI DI LIMITE ---
-MAX_REFINEMENT = 5
-MAX_PLANNING = 5
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
-# --- SCHEMA DI DECISIONE FINALE (CON SELF-RAG, ADAPTIVE-RAG E REFLEXION) ---
+# --- COSTANTI DI CONTROLLO DEL CICLO AGENTICO ---
+MAX_REFINEMENT = 4
+MAX_PLANNING = 4
+
+# --- SCHEMA DI DECISIONE SEMANTICA (SELF-RAG + ADAPTIVE-RAG + REFLEXION) ---
 class ValidatorDecision(BaseModel):
-    """USE THIS TOOL to issue your final routing decision."""
-    reflection: str = Field(description="REFLEXION: Critique past iterations. Why did previous retrievals fail? Is there a hallucination? How can we recover?")
-    query_complexity: Literal["simple", "complex", "already_decomposed"] = Field(description="ADAPTIVE-RAG: Assess if the query is a simple factoid, a complex multi-hop, or already broken down.")
-    is_context_relevant: bool = Field(description="SELF-RAG (IsRel): Determine if the evidence is relevant to the initial instruction and provides useful information to complete the task.")
-    is_query_answered: bool = Field(description="SELF-RAG (IsSup): Evaluate if the proposed Final Answer is fully supported by the information provided in the evidence. All information in output must be supported by the evidence without hallucinations.")
-    reasoning: str = Field(description="CHAIN OF THOUGHT: Combine the critiques above to justify your routing decision.")
-    feedback: str = Field(description="Specific instructions for the next agent. For Refiner: suggest 'decompose_query' for parallel searches. For Planner: suggest explicit exact keywords to search.")
+    """USE THIS TOOL to issue the semantic validation and routing decision."""
+    reflection: str = Field(
+        description="REFLEXION: Verbal critique of past iterations. Why did previous retrievals fail? Is there hallucination or missing context? How should the next step recover?"
+    )
+    query_complexity: Literal["simple", "complex", "already_decomposed"] = Field(
+        description="ADAPTIVE-RAG: Assess if the query is a simple factoid, a complex multi-hop question, or already decomposed into atomic sub-queries."
+    )
+    is_context_relevant: bool = Field(
+        description="SELF-RAG (IsRel): Determine if the retrieved context is semantically relevant and provides useful facts to answer the question."
+    )
+    is_query_answered: bool = Field(
+        description="SELF-RAG (IsSup): Determine if the proposed answer is strictly supported by the retrieved context without hallucinations."
+    )
+    reasoning: str = Field(
+        description="CHAIN OF THOUGHT: Step-by-step logical justification for the routing decision."
+    )
+    feedback: str = Field(
+        description="Specific verbal instructions for the next module. For Refiner: suggest decomposition or entity correction. For Planner: suggest explicit keywords or source (local_kb vs web)."
+    )
     next_action: Literal["route_to_refinement", "route_to_planning", "finish"] = Field(
-        description="The next node to send the execution to."
+        description="Routing destination: 'route_to_refinement', 'route_to_planning', or 'finish'."
     )
 
-# --- LOGICA DEL NODO VALIDATORE ---
+
+# --- NODO VALIDATORE ---
 def validator_node(state: GraphState, llm) -> dict:
     num_ref = state.get("num_refinement", 0)
     num_plan = state.get("num_planning", 0)
-    print(f"\n[VALIDATOR] Avvio ciclo decisionale (Ref={num_ref}, Plan={num_plan})...")
+    print(f"\n[VALIDATOR] Avvio ciclo di valutazione e routing (Ref={num_ref}/{MAX_REFINEMENT}, Plan={num_plan}/{MAX_PLANNING})...")
     
     llm_with_tools = llm.bind_tools([ValidatorDecision])
     
-    system_prompt = """You are the Semantic Routing Validator.
-Evaluate if the current sub-query is ready for retrieval, needs refinement, or is already answered.
+    system_prompt = """You are the Semantic Routing Validator and Quality Judge for an Agentic IR system.
+You enforce the Self-RAG, Adaptive-RAG, and Reflexion theoretical frameworks.
 
-ROUTING OPTIONS ('next_action'):
-1. 'finish': CHOOSE THIS FIRST if the Current Context or Final Answer completely answers the sub-query.
-2. 'route_to_planning': Choose this for most queries, including MULTI-HOP or sequential questions (e.g., "Who was the director of the movie starring X?"). The Planner uses the ReAct paradigm (Reasoning + Acting) and is perfectly capable of breaking down sequential tasks step-by-step using thoughts and actions.
-3. 'route_to_refinement': Choose this ONLY if the query consists of entirely INDEPENDENT, parallel questions, OR if it asks to compare two entities / check if they share a trait (e.g., "Were X and Y born in the same country?", "Who is older, X or Y?"). Finding X's trait and Y's trait are independent parallel tasks.
+EVALUATION FRAMEWORK:
+1. ADAPTIVE-RAG (Query Complexity):
+   - 'simple': Single atomic question (e.g. "When was X born?"). Route directly to 'route_to_planning'.
+   - 'complex': Ambiguous query, or questions with multiple independent entities being compared (e.g. "Were X and Y born in the same country?"). Route to 'route_to_refinement'.
+   - 'already_decomposed': Multiple sub-queries already split by '---'. Route to 'route_to_planning'.
 
-CRITICAL LOGIC RULE: Do not route to refinement just because a query is complex or multi-hop. Only route to refinement if the query requires parallel independent searches (like comparing two people).
+2. SELF-RAG CRITIQUE TOKENS:
+   - 'is_context_relevant' (IsRel): True if the retrieved documents contain facts related to the query; False if unrelated.
+   - 'is_query_answered' (IsSup): True ONLY if the retrieved documents fully support the answer. If the answer contains ungrounded guesses or claims not in the context, set False.
 
-FEEDBACK RULES ('feedback' field):
-- If the Refiner DROPPED an entity from the Original Query in the Current Query, you MUST point out the missing entity and demand the Refiner to restore it.
-- If the current context is totally irrelevant (Self-RAG IsRel=False), explicitly suggest DIFFERENT keywords or synonyms to search.
-- If the output is not fully supported (Self-RAG IsSup=False), point out the specific hallucinated fact so the Planner knows what to correct.
-- For 'route_to_refinement': Explicitly suggest breaking down the independent entities.
-- For 'finish': Leave empty.
+3. ROUTING RULES ('next_action'):
+   - 'finish': Choose ONLY if 'is_query_answered' is True and an answer exists. NEVER finish if no retrieval has taken place or if the answer is unsupported.
+   - 'route_to_planning': Default destination for search execution. If retrieved context is missing or incomplete, route here and provide suggested keywords or source ('local_kb' vs 'web').
+   - 'route_to_refinement': Choose if the query is messy, ambiguous, contains conversational fluff, or needs parallel decomposition for independent entities.
 
-CRITICAL INSTRUCTION: You do not support native function calling. You MUST manually output a RAW JSON object that matches the tool schema. DO NOT output any conversational text before or after the JSON.
-
---- FEW-SHOT EXAMPLES ---
-
-Example 1 (Ready to finish):
-```json
-{
-  "name": "ValidatorDecision",
-  "arguments": {
-    "reflection": "The context provides the required information.",
-    "query_complexity": "simple",
-    "is_context_relevant": true,
-    "is_query_answered": true,
-    "reasoning": "The query is fully answered by the context.",
-    "feedback": "The context successfully answers the question.",
-    "next_action": "finish"
-  }
-}
-```
-
-Example 2 (Needs refinement due to empty context or vague query):
-```json
-{
-  "name": "ValidatorDecision",
-  "arguments": {
-    "reflection": "The context is empty and the query is too conversational.",
-    "query_complexity": "complex",
-    "is_context_relevant": false,
-    "is_query_answered": false,
-    "reasoning": "The query needs to be rewritten or decomposed to extract the core entities.",
-    "feedback": "Rewrite the query to remove conversational noise and focus on the main entity.",
-    "next_action": "route_to_refinement"
-  }
-}
-```
-
-Example 3 (Ready for Planning):
-```json
-{
-  "name": "ValidatorDecision",
-  "arguments": {
-    "reflection": "The query is specific and well-formed, but the context is empty.",
-    "query_complexity": "simple",
-    "is_context_relevant": false,
-    "is_query_answered": false,
-    "reasoning": "Since the query is already clear, it is ready for retrieval.",
-    "feedback": "Proceed with document retrieval.",
-    "next_action": "route_to_planning"
-  }
-}
-```
-"""
+CRITICAL INSTRUCTION: Output a RAW JSON tool call matching ValidatorDecision. Do not output conversational text outside the JSON."""
 
     query_raw = state.get("current_query", state.get("original_query", ""))
     queries = [q.strip() for q in query_raw.split("\n---\n") if q.strip()]
     if not queries:
-        queries = [query_raw]
+        queries = [state.get("original_query", "")]
         
     context = state.get("retrieved_context", "")
+    final_answer = state.get("final_answer", "")
     
-    # SE ABBIAMO GIA' UNA FINAL ANSWER, VALUTIAMO SOLO LA QUERY ORIGINALE
-    if state.get("final_answer"):
-        print("\n🟢 [VALIDATOR] Trovata Final Answer! Valuto se risponde alla query originale...")
+    # Se abbiamo già una Final Answer proposta dal Planner, valutiamo la query originale nel suo insieme
+    evaluating_final_synthesis = bool(final_answer and num_plan > 0)
+    if evaluating_final_synthesis:
+        print("[VALIDATOR] Valutazione della Proposta Final Answer contro il Contesto (Self-RAG Grounding)...")
         queries = [state.get("original_query", "")]
-        context = f"Retrieved Context:\n{context}\n\nProposed Final Answer:\n{state['final_answer']}"
-        
+        eval_context = f"Retrieved Evidence:\n{context}\n\nProposed Final Answer:\n{final_answer}"
+    else:
+        eval_context = context if context else "No context retrieved yet."
+
     feedbacks = []
     actions = []
     
     for q_idx, q in enumerate(queries):
-        print(f"\n⚙️  [VALIDATOR] Valutazione sotto-query {q_idx+1}/{len(queries)}: '{q}'")
+        if not evaluating_final_synthesis:
+            print(f"[VALIDATOR] Analisi sotto-query {q_idx+1}/{len(queries)}: '{q}'")
+            
+        user_prompt = f"""Original User Request: '{state.get('original_query', '')}'
+Sub-Query under evaluation: '{q}'
+Current Retrieved Context / Answer:
+{eval_context}
+
+Metrics: Refinement Count={num_ref}/{MAX_REFINEMENT}, Planning Count={num_plan}/{MAX_PLANNING}
+
+Evaluate the state and issue your ValidatorDecision JSON."""
+
+        decision_obj = None
         try:
-            original_q = state.get('original_query', '')
-            full_queries_context = "\n".join([f"- {sq}" for sq in queries])
-            full_prompt = f"{system_prompt}\n\nGlobal Original Query: '{original_q}'\n\nAll current sub-queries:\n{full_queries_context}\n\nCurrently evaluating Sub-Query: '{q}'.\nCurrent Context: '{context}'\nRefinement Count: {num_ref}\nPlanning Count: {num_plan}\n\nAnalyze the state for the CURRENT sub-query and output the JSON tool call."
             response_msg = llm_with_tools.invoke([
-                HumanMessage(content=full_prompt)
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt)
             ])
             content_resp = getattr(response_msg, "content", str(response_msg))
         except Exception as e:
-            print(f"❌ [VALIDATOR ERROR] Errore API per la sub-query: {e}")
+            print(f"[VALIDATOR ERROR] Errore inferenza: {e}")
             actions.append("route_to_planning")
             continue
             
-        import json
-        decision_obj = None
-        
-        # 1. Controlliamo se ha usato tool_calls nativo
+        # 1. Parsing da tool_calls nativo
         if hasattr(response_msg, "tool_calls") and response_msg.tool_calls:
             t_call = response_msg.tool_calls[0]
             args = t_call.get("args", {})
-            safe_args = {
-                "reflection": args.get("reflection", "Fallback"),
-                "query_complexity": args.get("query_complexity", "complex"),
-                "is_context_relevant": args.get("is_context_relevant", False) in [True, "true", "True", 1],
-                "is_query_answered": args.get("is_query_answered", False) in [True, "true", "True", 1],
-                "reasoning": args.get("reasoning", "Fallback"),
-                "feedback": args.get("feedback", ""),
-                "next_action": args.get("next_action", "route_to_planning")
-            }
-            print(f"      💭 Reasoning: {safe_args['reasoning']}")
-            print(f"      ➡️  Action: {safe_args['next_action'].upper()}")
-            try:
-                decision_obj = ValidatorDecision(**safe_args)
-            except Exception as e:
-                print(f"[VALIDATOR DEBUG] Pydantic validation failed: {e}")
-        
-        # 2. Fallback su string parsing
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            if isinstance(args, dict) and args:
+                try:
+                    safe_args = {
+                        "reflection": args.get("reflection", "Iterative evaluation"),
+                        "query_complexity": args.get("query_complexity", "complex"),
+                        "is_context_relevant": args.get("is_context_relevant", False) in [True, "true", "True", 1],
+                        "is_query_answered": args.get("is_query_answered", False) in [True, "true", "True", 1],
+                        "reasoning": args.get("reasoning", "Standard reasoning"),
+                        "feedback": args.get("feedback", ""),
+                        "next_action": args.get("next_action", "route_to_planning")
+                    }
+                    decision_obj = ValidatorDecision(**safe_args)
+                except Exception as e:
+                    print(f"[VALIDATOR DEBUG] Pydantic validation error: {e}")
+
+        # 2. Parsing con sliding-window JSON parser
         if not decision_obj:
             i = 0
             while i < len(content_resp):
@@ -165,81 +149,114 @@ Example 3 (Ready for Planning):
                     escape = False
                     for j in range(i, len(content_resp)):
                         char = content_resp[j]
-                        if char == '"' and not escape: in_string = not in_string
+                        if char == '"' and not escape:
+                            in_string = not in_string
                         if not in_string:
-                            if char == '{': brace_level += 1
-                            elif char == '}': brace_level -= 1
+                            if char == '{':
+                                brace_level += 1
+                            elif char == '}':
+                                brace_level -= 1
                         if brace_level == 0:
                             try:
                                 json_str = content_resp[i:j+1]
-                                json_str = json_str.replace(": False", ": false").replace(": True", ": true").replace(":False", ":false").replace(":True", ":true")
+                                json_str = json_str.replace(": False", ": false").replace(": True", ": true")
                                 parsed = json.loads(json_str)
                                 if isinstance(parsed, dict):
                                     args = parsed.get("arguments", parsed.get("args", parsed.get("parameters", parsed))) if "name" in parsed else parsed
-                                    
-                                    next_act = str(args.get("next_action", "route_to_planning")).lower()
-                                    if next_act not in ["route_to_refinement", "route_to_planning", "finish"]:
-                                        next_act = "route_to_planning"
-                                        
-                                    safe_args = {
-                                        "reflection": args.get("reflection", args.get("反思", "Fallback")),
-                                        "query_complexity": args.get("query_complexity", "complex"),
-                                        "is_context_relevant": args.get("is_context_relevant", False) in [True, "true", "True", 1],
-                                        "is_query_answered": args.get("is_query_answered", False) in [True, "true", "True", 1],
-                                        "reasoning": args.get("reasoning", args.get("理由", "Fallback")),
-                                        "feedback": args.get("feedback", args.get("反馈", "")),
-                                        "next_action": next_act
-                                    }
-                                    decision_obj = ValidatorDecision(**safe_args)
-                                    break
-                            except Exception as e:
-                                print(f"[VALIDATOR DEBUG] Errore parsing JSON manuale: {e}")
+                                    if isinstance(args, str):
+                                        try:
+                                            args = json.loads(args)
+                                        except Exception:
+                                            args = {}
+                                    if isinstance(args, dict):
+                                        next_act = str(args.get("next_action", "route_to_planning")).lower()
+                                        if next_act not in ["route_to_refinement", "route_to_planning", "finish"]:
+                                            next_act = "route_to_planning"
+                                            
+                                        safe_args = {
+                                            "reflection": args.get("reflection", "Sliding window extraction"),
+                                            "query_complexity": args.get("query_complexity", "complex"),
+                                            "is_context_relevant": args.get("is_context_relevant", False) in [True, "true", "True", 1],
+                                            "is_query_answered": args.get("is_query_answered", False) in [True, "true", "True", 1],
+                                            "reasoning": args.get("reasoning", "Extracted CoT"),
+                                            "feedback": args.get("feedback", ""),
+                                            "next_action": next_act
+                                        }
+                                        decision_obj = ValidatorDecision(**safe_args)
+                                        break
+                            except Exception:
                                 pass
                             i = j
                             break
-                        if char == '\\': escape = not escape
-                        else: escape = False
+                        if char == '\\':
+                            escape = not escape
+                        else:
+                            escape = False
                 i += 1
-            
+
+        # Fallback di sicurezza se nessun JSON è stato prodotto
         if not decision_obj:
-            print("[VALIDATOR] JSON non trovato. Uso fallback sicuro.")
-            print(f"[VALIDATOR DEBUG] Raw LLM Response Content: {content_resp}")
-            print(f"[VALIDATOR DEBUG] Raw LLM Tool Calls: {getattr(response_msg, 'tool_calls', 'NO TOOL CALLS')}")
-            decision_obj = ValidatorDecision(reflection="Fallback", query_complexity="complex", is_context_relevant=False, is_query_answered=False, reasoning="Fallback", feedback="Fallback", next_action="route_to_planning")
-            
-        final_action = decision_obj.next_action
-        if final_action == "finish" and num_plan == 0:
-            final_action = "route_to_planning"
-        elif final_action == "route_to_refinement" and num_ref >= 3:
-            final_action = "route_to_planning"
-        elif final_action == "route_to_planning" and num_plan >= 3:
-            final_action = "finish"
-            
-        actions.append(final_action)
+            print("[VALIDATOR] JSON non riconosciuto. Applico fallback euristico sicuro.")
+            decision_obj = ValidatorDecision(
+                reflection="Fallback: model produced non-JSON output.",
+                query_complexity="complex",
+                is_context_relevant=bool(context),
+                is_query_answered=bool(final_answer),
+                reasoning="Safe heuristic fallback.",
+                feedback="Proceed to planning for factual retrieval.",
+                next_action="route_to_planning" if num_plan < MAX_PLANNING else "finish"
+            )
+
+        print(f"      [REASONING]: {decision_obj.reasoning[:120]}...")
+        print(f"      [SELF-RAG CRITIQUE]: IsRel={decision_obj.is_context_relevant} | IsSup={decision_obj.is_query_answered}")
+        print(f"      [ACTION LLM]: {decision_obj.next_action.upper()}")
+
+        # --- RIGOROSA APPLICAZIONE DEI FRAMEWORK ACCADEMICI SUL ROUTING ---
+        act = decision_obj.next_action
+
+        # 1. Regola Self-RAG (IsSup): Se la risposta non è supportata, non può terminare
+        if act == "finish" and not decision_obj.is_query_answered and num_plan < MAX_PLANNING:
+            print("      [SELF-RAG VETO] Risposta non supportata dal contesto (IsSup=False). Reindirizzo al Planner!")
+            act = "route_to_planning"
+
+        # 2. Se non è mai stato fatto planning, non si può terminare
+        if act == "finish" and num_plan == 0:
+            print("      [VALIDATOR VETO] Impossibile terminare senza retrieval. Instradamento al Planner.")
+            act = "route_to_planning"
+
+        # 3. Limiti massimi di sicurezza per prevenire cicli infiniti
+        if act == "route_to_refinement" and num_ref >= MAX_REFINEMENT:
+            print(f"      [LIMIT REACHED] Raggiunto limite refinement ({MAX_REFINEMENT}). Forzo passaggio a planning.")
+            act = "route_to_planning"
+        elif act == "route_to_planning" and num_plan >= MAX_PLANNING:
+            print(f"      [LIMIT REACHED] Raggiunto limite planning ({MAX_PLANNING}). Forzo completamento del grafo.")
+            act = "finish"
+
+        actions.append(act)
         if decision_obj.feedback:
-            feedbacks.append(f"For sub-query '{q}': {decision_obj.feedback}")
-            
-    # Aggregate actions logically
+            feedbacks.append(f"Validator feedback for '{q}': {decision_obj.feedback}")
+            if decision_obj.reflection:
+                feedbacks.append(f"Reflection: {decision_obj.reflection}")
+
+    # Aggregazione delle azioni per il grafo
     if "route_to_refinement" in actions:
         overall_action = "route_to_refinement"
     elif "route_to_planning" in actions:
         overall_action = "route_to_planning"
     else:
         overall_action = "finish"
-        
-    print(f"      ➡️  [VALIDATOR] Instradamento globale verso: {overall_action.upper()}")
-    
+
+    print(f"[VALIDATOR] Instradamento globale verso nodo: {overall_action.upper()}\n")
+
+    # Mantenimento o reset dello stato
     state_update = {
         "next_node": overall_action,
-        "feedback_history": feedbacks if feedbacks else []
+        "feedback_history": feedbacks
     }
-    
-    # Se avevamo una final answer ma il Validator l'ha bocciata (non finish)
-    current_final_answer = state.get("final_answer", "")
-    current_original_query = state.get("original_query", "")
-    
-    if current_final_answer and overall_action != "finish":
-        print("   ♻️  [VALIDATOR] Final Answer bocciata o incompleta. Resetto la risposta e chiedo nuovo routing.")
+
+    # Se avevamo una final answer ma il Validator l'ha bocciata (Self-RAG IsSup=False o action != finish)
+    if final_answer and overall_action != "finish":
+        print("[VALIDATOR] Final Answer respinta dal controllo Self-RAG. Resetto e chiedo nuova ricerca.")
         state_update["final_answer"] = ""
-        
+
     return state_update
