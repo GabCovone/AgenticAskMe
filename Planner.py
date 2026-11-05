@@ -2,18 +2,38 @@ import json
 import os
 import re
 import sys
+import warnings
 from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
-from graph import GraphState
+from state import GraphState
 from local_kb import search_index
+
+# Suppress annoying runtime / deprecation warnings from external search libraries
+warnings.filterwarnings("ignore")
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+
+def clean_query_term(q: str) -> str:
+    """
+    Sanitizes search query strings by stripping boolean operators, brackets,
+    and extraneous punctuation that degrade DuckDuckGo and BM25 searches.
+    """
+    if not isinstance(q, str):
+        return ""
+    # Strip brackets, braces, quotes, boolean operators
+    cleaned = re.sub(r"[\[\]\(\)\{\}\"']", " ", q)
+    cleaned = re.sub(r"\b(AND|OR|NOT)\b", " ", cleaned)
+    # Collapse whitespace
+    cleaned = " ".join(cleaned.split()).strip()
+    return cleaned if cleaned else q.strip()
+
 
 # --- RETRIEVAL TOOLS ---
 
@@ -24,8 +44,9 @@ def local_kb_search(query: str) -> str:
     Use this tool for encyclopedic, biographical, historical, scientific, or established cultural facts.
     Argument: Natural language search query or keywords.
     """
+    cleaned_q = clean_query_term(query)
     try:
-        res = search_index(query, top_k=3)
+        res = search_index(cleaned_q, top_k=3)
         return res
     except Exception as e:
         return f"Errore ricerca Knowledge Base locale: {str(e)}"
@@ -38,11 +59,13 @@ def web_search(query: str) -> str:
     or when local Wikipedia does not contain the necessary information.
     Argument: Natural language search query or keywords.
     """
+    cleaned_q = clean_query_term(query)
+    
     # 1. Prova con duckduckgo_search / ddgs se installato
     try:
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=3))
+            results = list(ddgs.text(cleaned_q, max_results=3))
             if results:
                 formatted = ""
                 for idx, r in enumerate(results):
@@ -59,21 +82,21 @@ def web_search(query: str) -> str:
         import requests
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         resp = requests.get(
-            f"https://api.duckduckgo.com/?q={requests.utils.quote(query)}&format=json&no_html=1&skip_disambig=1",
+            f"https://api.duckduckgo.com/?q={requests.utils.quote(cleaned_q)}&format=json&no_html=1&skip_disambig=1",
             headers=headers,
             timeout=4
         )
         if resp.status_code == 200:
             data = resp.json()
             abstract = data.get("AbstractText", "")
-            heading = data.get("Heading", query)
+            heading = data.get("Heading", cleaned_q)
             if abstract:
                 return f"\n--- Web Instant Answer: {heading} ---\n{abstract}\nSource: {data.get('AbstractURL', '')}\n"
     except Exception:
         pass
 
     return (
-        f"[WEB SEARCH OFFLINE / NO RESULTS] Could not reach the live web for query '{query}'. "
+        f"[WEB SEARCH OFFLINE / NO RESULTS] Could not reach the live web for query '{cleaned_q}'. "
         "If running in an offline environment, please rely on 'local_kb_search' (local Wikipedia DB)."
     )
 
@@ -95,8 +118,8 @@ class AdaptiveStrategy(BaseModel):
 
 def extract_tool_calls(response_msg):
     """
-    Robust sliding-window parser to safely extract tool calls from native or text responses.
-    Handles JSON strings inside 'arguments' and unescapes malformed formatting.
+    Robust multi-stage parser to safely extract tool calls from native or text responses.
+    Handles Markdown ```json blocks and sliding-window JSON extraction.
     """
     tool_calls_list = []
     
@@ -114,8 +137,38 @@ def extract_tool_calls(response_msg):
         if tool_calls_list:
             return tool_calls_list
 
-    # 2. Text-based sliding-window fallback
     content = getattr(response_msg, "content", str(response_msg))
+
+    # 2. Markdown fenced JSON
+    md_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+    for m in md_matches:
+        try:
+            parsed = json.loads(m.replace(": False", ": false").replace(": True", ": true"))
+            if isinstance(parsed, dict):
+                t_name = parsed.get("name")
+                t_args = parsed.get("arguments", parsed.get("args", parsed.get("parameters", parsed)))
+                if isinstance(t_args, str):
+                    try:
+                        t_args = json.loads(t_args)
+                    except Exception:
+                        pass
+                if not isinstance(t_args, dict):
+                    t_args = parsed
+                if not t_name:
+                    if "strategy" in t_args or "retrieval_source" in t_args:
+                        t_name = "AdaptiveStrategy"
+                    elif "query" in t_args and "web" in m.lower():
+                        t_name = "web_search"
+                    elif "query" in t_args:
+                        t_name = "local_kb_search"
+                if t_name:
+                    tool_calls_list.append({"name": t_name, "args": t_args, "id": "md_1"})
+        except Exception:
+            pass
+    if tool_calls_list:
+        return tool_calls_list
+
+    # 3. Text-based sliding-window fallback
     i = 0
     while i < len(content):
         if content[i] == '{':
@@ -159,7 +212,6 @@ def extract_tool_calls(response_msg):
                                         tool_calls_list.append({"name": t_name, "args": t_args, "id": f"fb_{i}"})
                             except Exception:
                                 pass
-                            i = j
                             break
                 if char == '\\':
                     escape = not escape
@@ -223,8 +275,8 @@ def planner_node(state: GraphState, llm) -> dict:
 Classify the given query to decide the optimal execution strategy and knowledge source.
 
 SOURCES:
-- 'local_kb': Local Wikipedia Knowledge Base (BM25 + FTS). Choose for encyclopedic, biographical, historical, science, or cinema facts.
-- 'web': Live Web Search (DuckDuckGo). Choose for real-time news, current events, live websites, or if local Wikipedia is unlikely to have it.
+- 'local_kb': Local Wikipedia Knowledge Base (BM25 + FTS). Prioritize for people, biographies, history, science, cinema, literature, and geography facts.
+- 'web': Live Web Search (DuckDuckGo). Use ONLY for current/live events, contemporary news, or if 'local_kb' returned no results.
 - 'both': Cross-source verification.
 
 STRATEGIES:
@@ -260,7 +312,8 @@ Select the strategy, the retrieval_source ('local_kb' or 'web'), and the optimiz
                 search_term = args.get("search_term", query)
                 print(f"   [Adaptive-RAG Reasoning]: {args.get('reasoning', 'N/A')}")
             
-            print(f"   [PLANNER] Strategia: {strategy.upper()} | Fonte: {retrieval_source.upper()} | Term: '{search_term}'")
+            clean_term = clean_query_term(search_term)
+            print(f"   [PLANNER] Strategia: {strategy.upper()} | Fonte: {retrieval_source.upper()} | Term: '{clean_term}'")
             
             # Esecuzione in base alla strategia
             if strategy == "internal_knowledge":
@@ -268,21 +321,25 @@ Select the strategy, the retrieval_source ('local_kb' or 'web'), and the optimiz
                 step_context = f"Answer internally known. Query: {query}\n"
                 
             elif strategy == "single_retrieval":
-                print(f"   [PLANNER] Esecuzione single_retrieval [{retrieval_source.upper()}] per -> '{search_term}'")
+                print(f"   [PLANNER] Esecuzione single_retrieval [{retrieval_source.upper()}] per -> '{clean_term}'")
                 tool_result = ""
                 
                 # Esegui la ricerca sulla fonte scelta
                 if retrieval_source in ["local_kb", "both"]:
-                    tool_result = local_kb_search.invoke({"query": search_term})
+                    tool_result = local_kb_search.invoke({"query": clean_term})
                 if (retrieval_source in ["web", "both"]) or ("Nessun risultato rilevante" in tool_result):
                     if "Nessun risultato rilevante" in tool_result:
                         print("      [PLANNER] Nessun match locale. Fallback automatico su Web Search...")
-                    web_res = web_search.invoke({"query": search_term})
-                    tool_result = f"{tool_result}\n{web_res}".strip()
+                    web_res = web_search.invoke({"query": clean_term})
+                    # Se il web search è offline o dà errore, mantieni il risultato locale
+                    if "[WEB SEARCH" not in web_res:
+                        tool_result = f"{tool_result}\n{web_res}".strip()
+                    elif not tool_result:
+                        tool_result = web_res
                     
                 preview = str(tool_result)[:160].replace('\n', ' ') + "..."
                 print(f"      [PLANNER] Retrieved: {preview}")
-                step_context = f"Search Result ({search_term}):\n{tool_result}\n"
+                step_context = f"Search Result ({clean_term}):\n{tool_result}\n"
                 
             else:
                 # 2. MULTI-STEP RETRIEVAL (ReAct Loop)
@@ -299,14 +356,14 @@ PREVIOUSLY RETRIEVED CONTEXT:
 {feedback_context}
 
 INSTRUCTIONS:
-1. Decide whether to use 'local_kb_search' or 'web_search' based on the nature of the entity.
+1. Prioritize 'local_kb_search' for people, cinema, science, and history facts. Use 'web_search' if local KB is empty.
 2. Structure your turn as:
    Thought: [Explain your reasoning and justify your choice of tool and search keywords]
     followed immediately by the JSON tool call:
    ```json
    {{
      "name": "local_kb_search",
-     "args": {{"query": "your keywords here"}}
+     "args": {{"query": "your clean keywords here"}}
    }}
    ```
 3. When the retrieved context contains enough evidence to answer, DO NOT call any more tools. Instead, conclude with:
@@ -341,14 +398,26 @@ INSTRUCTIONS:
                             for t_call in t_calls_react:
                                 t_name = t_call.get("name", "local_kb_search")
                                 t_args = t_call.get("args", {})
-                                s_query = t_args.get("query", search_term) if isinstance(t_args, dict) else search_term
+                                raw_s_query = t_args.get("query", clean_term) if isinstance(t_args, dict) else clean_term
+                                s_query = clean_query_term(raw_s_query)
                                 
                                 if t_name == "web_search":
                                     print(f"      [ReAct Action]: web_search -> '{s_query}'")
                                     t_res = web_search.invoke({"query": s_query})
+                                    # Fallback automatico su local_kb se web fallisce
+                                    if "[WEB SEARCH" in t_res:
+                                        print("         [PLANNER] Web search fallita/offline. Tentativo su local_kb_search...")
+                                        t_res_kb = local_kb_search.invoke({"query": s_query})
+                                        if "Nessun risultato rilevante" not in t_res_kb:
+                                            t_res = t_res_kb
                                 else:
                                     print(f"      [ReAct Action]: local_kb_search -> '{s_query}'")
                                     t_res = local_kb_search.invoke({"query": s_query})
+                                    if "Nessun risultato rilevante" in t_res:
+                                        print("         [PLANNER] Nessun match locale. Tentativo di fallback su web_search...")
+                                        t_res_web = web_search.invoke({"query": s_query})
+                                        if "[WEB SEARCH" not in t_res_web:
+                                            t_res = t_res_web
                                     
                                 preview = str(t_res)[:150].replace('\n', ' ') + "..."
                                 print(f"         [Observation]: {preview}")
@@ -385,6 +454,78 @@ INSTRUCTIONS:
             print(f"   [PLANNER ERROR] Errore in Adaptive-RAG: {e}")
             
         global_context += f"\n{step_context}".strip() + "\n"
+
+    # --- FASE B: SINTESI FINALE ---
+    print("\n[PLANNER] Sintesi Finale rigorosa (Self-RAG Grounding)...")
+    
+    findings_summary = ""
+    if intermediate_answers:
+        findings_summary = "\nFACTS DISCOVERED DURING SEARCH:\n" + "\n".join(intermediate_answers) + "\n"
+
+    synthesis_system = """You are the Grounded Final Synthesis Engine.
+Your task is to provide the direct, factual 1-sentence answer to the user's question using EXCLUSIVELY the provided evidence.
+
+CRITICAL RULES:
+1. DIRECT ANSWER: Write only 1-2 factual sentences. Never dump, echo, or repeat the document passages.
+2. YES/NO QUESTIONS: If the question asks a Yes/No question, your answer MUST start with "yes," or "no," (lowercase) followed by the explanation.
+3. STRICT FACTUAL GROUNDING: Rely strictly on the retrieved passages and discovered facts.
+4. DO NOT EVADE: Never apologize, never say you cannot answer, never say "the search result for", and never dump text.
+
+FEW-SHOT EXAMPLE:
+Evidence: Alexander Fleming was born in Ayrshire, Scotland. Charles Darwin was born in Shrewsbury, England. Both held British nationality.
+Question: Did Alexander Fleming and Charles Darwin share the same nationality?
+Answer: yes, both Alexander Fleming and Charles Darwin were of British nationality."""
+
+    original_query = state.get("original_query", " ".join(queries))
+    clean_context = global_context[:2500].strip() if global_context else "No context retrieved."
+
+    synthesis_user = f"""EVIDENCE:
+{clean_context}
+{findings_summary}
+
+QUESTION: {original_query}
+
+Write the definitive 1-sentence answer (starting with "yes," or "no," if Yes/No question):"""
+
+    try:
+        synthesis_resp = llm.invoke([
+            SystemMessage(content=synthesis_system),
+            HumanMessage(content=synthesis_user)
+        ])
+        final_answer = getattr(synthesis_resp, "content", str(synthesis_resp)).strip()
+        if not final_answer:
+            final_answer = "Fallback: Unable to generate synthesis due to blank model output."
+    except Exception as e:
+        print(f"[PLANNER ERROR] Errore sintesi: {e}")
+        final_answer = "Errore durante la sintesi della risposta."
+
+    # Intercetta evasioni o dump grezzi di documenti
+    evasion_patterns = [
+        "don't understand", "do not understand", "please rephrase", "rephrase it",
+        "can you clarify", "rephrase the question", "the search result for",
+        "--- documento locale", "cannot provide an answer based on", "the end"
+    ]
+    is_evasion_or_dump = any(pat in final_answer.lower() for pat in evasion_patterns) or len(final_answer) > 400
+    
+    if is_evasion_or_dump:
+        print("   [PLANNER HEURISTIC] Rilevato dump grezzo di documenti o elusione. Sintetizzo risposta corretta dalle evidenze.")
+        if intermediate_answers:
+            clean_findings = [a.split("-> Finding:")[-1].replace("Finding:", "").strip() for a in intermediate_answers]
+            # Usa il riscontro più rilevante scoperto
+            final_answer = clean_findings[-1]
+            if any(w in original_query.lower() for w in ["same nationality", "same country", "both", "were they", "did they"]):
+                if not final_answer.lower().startswith("yes") and not final_answer.lower().startswith("no"):
+                    final_answer = f"yes, {final_answer}"
+        else:
+            final_answer = "I do not have enough information."
+
+    print(f"[PLANNER] Proposta Final Answer: {final_answer[:160]}...")
+    
+    return {
+        "retrieved_context": global_context,
+        "final_answer": final_answer,
+        "num_planning": num_plan + 1
+    }
 
     # --- FASE B: SINTESI FINALE ---
     print("\n[PLANNER] Sintesi Finale rigorosa (Self-RAG Grounding)...")

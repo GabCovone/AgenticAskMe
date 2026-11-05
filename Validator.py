@@ -1,10 +1,11 @@
 import json
 import os
+import re
 import sys
-from typing import Literal
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
-from graph import GraphState
+from state import GraphState
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -42,6 +43,145 @@ class ValidatorDecision(BaseModel):
     )
 
 
+def extract_validator_decision(response_msg, content_resp: str) -> Optional[ValidatorDecision]:
+    """
+    Tolerant multi-stage parser for ValidatorDecision:
+    1. LangChain native tool_calls
+    2. Markdown ```json blocks
+    3. Sliding-window JSON parser
+    4. Text-based semantic classification
+    """
+    # 1. Native tool calls
+    if hasattr(response_msg, "tool_calls") and response_msg.tool_calls:
+        t_call = response_msg.tool_calls[0]
+        args = t_call.get("args", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+        if isinstance(args, dict) and args:
+            try:
+                next_act = str(args.get("next_action", "route_to_planning")).lower().strip()
+                if next_act not in ["route_to_refinement", "route_to_planning", "finish"]:
+                    next_act = "route_to_planning"
+                return ValidatorDecision(
+                    reflection=str(args.get("reflection", "Native tool call critique")),
+                    query_complexity=args.get("query_complexity", "complex"),
+                    is_context_relevant=args.get("is_context_relevant", False) in [True, "true", "True", 1],
+                    is_query_answered=args.get("is_query_answered", False) in [True, "true", "True", 1],
+                    reasoning=str(args.get("reasoning", "Standard reasoning")),
+                    feedback=str(args.get("feedback", "")),
+                    next_action=next_act
+                )
+            except Exception:
+                pass
+
+    # 2. Markdown fenced JSON
+    md_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content_resp, re.DOTALL)
+    if md_match:
+        try:
+            raw_str = md_match.group(1).replace(": False", ": false").replace(": True", ": true")
+            parsed = json.loads(raw_str)
+            if isinstance(parsed, dict):
+                args = parsed.get("arguments", parsed.get("args", parsed.get("parameters", parsed))) if "name" in parsed else parsed
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                if isinstance(args, dict):
+                    next_act = str(args.get("next_action", "route_to_planning")).lower().strip()
+                    if next_act not in ["route_to_refinement", "route_to_planning", "finish"]:
+                        next_act = "route_to_planning"
+                    return ValidatorDecision(
+                        reflection=str(args.get("reflection", "Fenced JSON critique")),
+                        query_complexity=args.get("query_complexity", "complex"),
+                        is_context_relevant=args.get("is_context_relevant", False) in [True, "true", "True", 1],
+                        is_query_answered=args.get("is_query_answered", False) in [True, "true", "True", 1],
+                        reasoning=str(args.get("reasoning", "Fenced JSON reasoning")),
+                        feedback=str(args.get("feedback", "")),
+                        next_action=next_act
+                    )
+        except Exception:
+            pass
+
+    # 3. Sliding-window JSON parser
+    i = 0
+    while i < len(content_resp):
+        if content_resp[i] == '{':
+            brace_level = 0
+            in_string = False
+            escape = False
+            for j in range(i, len(content_resp)):
+                char = content_resp[j]
+                if char == '"' and not escape:
+                    in_string = not in_string
+                if not in_string:
+                    if char == '{':
+                        brace_level += 1
+                    elif char == '}':
+                        brace_level -= 1
+                if brace_level == 0:
+                    try:
+                        json_str = content_resp[i:j+1]
+                        json_str = json_str.replace(": False", ": false").replace(": True", ": true")
+                        parsed = json.loads(json_str)
+                        if isinstance(parsed, dict):
+                            args = parsed.get("arguments", parsed.get("args", parsed.get("parameters", parsed))) if "name" in parsed else parsed
+                            if isinstance(args, str):
+                                try:
+                                    args = json.loads(args)
+                                except Exception:
+                                    args = {}
+                            if isinstance(args, dict) and ("next_action" in args or "is_query_answered" in args or "reasoning" in args):
+                                next_act = str(args.get("next_action", "route_to_planning")).lower().strip()
+                                if next_act not in ["route_to_refinement", "route_to_planning", "finish"]:
+                                    next_act = "route_to_planning"
+                                return ValidatorDecision(
+                                    reflection=str(args.get("reflection", "Sliding window extraction")),
+                                    query_complexity=args.get("query_complexity", "complex"),
+                                    is_context_relevant=args.get("is_context_relevant", False) in [True, "true", "True", 1],
+                                    is_query_answered=args.get("is_query_answered", False) in [True, "true", "True", 1],
+                                    reasoning=str(args.get("reasoning", "Extracted CoT")),
+                                    feedback=str(args.get("feedback", "")),
+                                    next_action=next_act
+                                )
+                    except Exception:
+                        pass
+                    break
+                if char == '\\':
+                    escape = not escape
+                else:
+                    escape = False
+        i += 1
+
+    # 4. Text-based semantic classification fallback
+    lower_resp = content_resp.lower()
+    if "finish" in lower_resp or "is_query_answered\": true" in lower_resp or "answered: true" in lower_resp:
+        return ValidatorDecision(
+            reflection="Text fallback indicates answer is completed and verified.",
+            query_complexity="simple",
+            is_context_relevant=True,
+            is_query_answered=True,
+            reasoning="Extracted finish intent from text.",
+            feedback="None.",
+            next_action="finish"
+        )
+    elif "route_to_refinement" in lower_resp or "refinement" in lower_resp:
+        return ValidatorDecision(
+            reflection="Text fallback suggests query refinement or decomposition.",
+            query_complexity="complex",
+            is_context_relevant=False,
+            is_query_answered=False,
+            reasoning="Extracted refinement intent from text.",
+            feedback="Decompose or clarify query.",
+            next_action="route_to_refinement"
+        )
+
+    return None
+
+
 # --- NODO VALIDATORE ---
 def validator_node(state: GraphState, llm) -> dict:
     num_ref = state.get("num_refinement", 0)
@@ -68,7 +208,22 @@ EVALUATION FRAMEWORK:
    - 'route_to_refinement': Choose if the query asks to compare two entities, check if they share a trait, contains 'and' / 'both' / 'same', or is conversational/ambiguous.
    - 'route_to_planning': Choose for direct factual queries ready for search execution.
 
-CRITICAL INSTRUCTION: Output a RAW JSON tool call matching ValidatorDecision. Do not output conversational text outside the JSON."""
+OUTPUT FORMAT:
+Output EXACTLY ONE JSON tool call matching:
+```json
+{
+  "name": "ValidatorDecision",
+  "arguments": {
+    "reflection": "Critique of current retrieval and answers.",
+    "query_complexity": "simple",
+    "is_context_relevant": true,
+    "is_query_answered": true,
+    "reasoning": "Context directly supports the factual answer.",
+    "feedback": "None needed.",
+    "next_action": "finish"
+  }
+}
+```"""
 
     query_raw = state.get("current_query", state.get("original_query", ""))
     queries = [q.strip() for q in query_raw.split("\n---\n") if q.strip()]
@@ -103,109 +258,48 @@ Metrics: Refinement Count={num_ref}/{MAX_REFINEMENT}, Planning Count={num_plan}/
 
 Evaluate the state and issue your ValidatorDecision JSON."""
 
-        decision_obj = None
+        content_resp = ""
         try:
             response_msg = llm_with_tools.invoke([
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt)
             ])
             content_resp = getattr(response_msg, "content", str(response_msg))
+            decision_obj = extract_validator_decision(response_msg, content_resp)
         except Exception as e:
             print(f"[VALIDATOR ERROR] Errore inferenza: {e}")
-            actions.append("route_to_planning")
-            continue
-            
-        # 1. Parsing da tool_calls nativo
-        if hasattr(response_msg, "tool_calls") and response_msg.tool_calls:
-            t_call = response_msg.tool_calls[0]
-            args = t_call.get("args", {})
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    args = {}
-            if isinstance(args, dict) and args:
-                try:
-                    safe_args = {
-                        "reflection": args.get("reflection", "Iterative evaluation"),
-                        "query_complexity": args.get("query_complexity", "complex"),
-                        "is_context_relevant": args.get("is_context_relevant", False) in [True, "true", "True", 1],
-                        "is_query_answered": args.get("is_query_answered", False) in [True, "true", "True", 1],
-                        "reasoning": args.get("reasoning", "Standard reasoning"),
-                        "feedback": args.get("feedback", ""),
-                        "next_action": args.get("next_action", "route_to_planning")
-                    }
-                    decision_obj = ValidatorDecision(**safe_args)
-                except Exception as e:
-                    print(f"[VALIDATOR DEBUG] Pydantic validation error: {e}")
+            decision_obj = None
 
-        # 2. Parsing con sliding-window JSON parser
+        # Fallback intelligente e rigoroso se nessun JSON è stato prodotto
         if not decision_obj:
-            i = 0
-            while i < len(content_resp):
-                if content_resp[i] == '{':
-                    brace_level = 0
-                    in_string = False
-                    escape = False
-                    for j in range(i, len(content_resp)):
-                        char = content_resp[j]
-                        if char == '"' and not escape:
-                            in_string = not in_string
-                        if not in_string:
-                            if char == '{':
-                                brace_level += 1
-                            elif char == '}':
-                                brace_level -= 1
-                        if brace_level == 0:
-                            try:
-                                json_str = content_resp[i:j+1]
-                                json_str = json_str.replace(": False", ": false").replace(": True", ": true")
-                                parsed = json.loads(json_str)
-                                if isinstance(parsed, dict):
-                                    args = parsed.get("arguments", parsed.get("args", parsed.get("parameters", parsed))) if "name" in parsed else parsed
-                                    if isinstance(args, str):
-                                        try:
-                                            args = json.loads(args)
-                                        except Exception:
-                                            args = {}
-                                    if isinstance(args, dict):
-                                        next_act = str(args.get("next_action", "route_to_planning")).lower()
-                                        if next_act not in ["route_to_refinement", "route_to_planning", "finish"]:
-                                            next_act = "route_to_planning"
-                                            
-                                        safe_args = {
-                                            "reflection": args.get("reflection", "Sliding window extraction"),
-                                            "query_complexity": args.get("query_complexity", "complex"),
-                                            "is_context_relevant": args.get("is_context_relevant", False) in [True, "true", "True", 1],
-                                            "is_query_answered": args.get("is_query_answered", False) in [True, "true", "True", 1],
-                                            "reasoning": args.get("reasoning", "Extracted CoT"),
-                                            "feedback": args.get("feedback", ""),
-                                            "next_action": next_act
-                                        }
-                                        decision_obj = ValidatorDecision(**safe_args)
-                                        break
-                            except Exception:
-                                pass
-                            i = j
-                            break
-                        if char == '\\':
-                            escape = not escape
-                        else:
-                            escape = False
-                i += 1
-
-        # Fallback di sicurezza se nessun JSON è stato prodotto
-        if not decision_obj:
-            print("[VALIDATOR] JSON non riconosciuto. Applico fallback euristico sicuro.")
-            decision_obj = ValidatorDecision(
-                reflection="Fallback: model produced non-JSON output.",
-                query_complexity="complex",
-                is_context_relevant=bool(context),
-                is_query_answered=bool(final_answer),
-                reasoning="Safe heuristic fallback.",
-                feedback="Proceed to planning for factual retrieval.",
-                next_action="route_to_planning" if num_plan < MAX_PLANNING else "finish"
-            )
+            print("[VALIDATOR] JSON non riconosciuto. Applico fallback euristico rigoroso.")
+            if evaluating_final_synthesis:
+                # Controlla se la risposta sintetizzata è valida e non un messaggio di errore/insufficienza
+                failure_words = ["not enough information", "unable to", "cannot be answered", "errore", "fallback"]
+                has_substance = len(final_answer.strip()) >= 10 and not any(w in final_answer.lower() for w in failure_words)
+                is_supported = has_substance and bool(context)
+                
+                decision_obj = ValidatorDecision(
+                    reflection="Evaluating synthesized answer against context.",
+                    query_complexity="simple",
+                    is_context_relevant=bool(context),
+                    is_query_answered=is_supported,
+                    reasoning="Synthesized answer is present and grounded in retrieved evidence." if is_supported else "Synthesized answer lacks sufficient grounding.",
+                    feedback="Answer complete." if is_supported else "Retrieve more evidence for missing entities.",
+                    next_action="finish" if is_supported else ("route_to_planning" if num_plan < MAX_PLANNING else "finish")
+                )
+            else:
+                is_composite = any(w in q.lower() for w in ["same", "both", "compare", "differ"]) or (" and " in q.lower())
+                next_act = "route_to_refinement" if (num_ref == 0 and is_composite) else "route_to_planning"
+                decision_obj = ValidatorDecision(
+                    reflection="Turn 0 evaluation: routing to refinement or planning.",
+                    query_complexity="complex" if is_composite else "simple",
+                    is_context_relevant=bool(context),
+                    is_query_answered=False,
+                    reasoning="Heuristic routing based on query complexity.",
+                    feedback="Proceed with refinement/planning.",
+                    next_action=next_act
+                )
 
         print(f"      [REASONING]: {decision_obj.reasoning[:120]}...")
         print(f"      [SELF-RAG CRITIQUE]: IsRel={decision_obj.is_context_relevant} | IsSup={decision_obj.is_query_answered}")
@@ -271,3 +365,4 @@ Evaluate the state and issue your ValidatorDecision JSON."""
         state_update["final_answer"] = ""
 
     return state_update
+

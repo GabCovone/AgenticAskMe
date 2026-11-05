@@ -2,17 +2,7 @@ import os
 import functools
 from typing import TypedDict, List, Literal, Optional
 from langgraph.graph import StateGraph, START, END
-
-# --- STATO GLOBALE CONDIVISO DEL GRAFO ---
-class GraphState(TypedDict):
-    original_query: str
-    current_query: str
-    retrieved_context: str
-    num_refinement: int
-    num_planning: int
-    next_node: str
-    feedback_history: List[str]
-    final_answer: str
+from state import GraphState
 
 # --- CONFIGURAZIONE CENTRALE DEL MODELLO ---
 # Modello predefinito: Mistral-Nemo-Instruct (12B Q5_K_M) per ragionamento avanzato,

@@ -1,10 +1,11 @@
 import json
 import ast
+import re
 import sys
-from typing import List, Set
+from typing import List, Set, Optional, Dict, Any
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage
-from graph import GraphState
+from state import GraphState
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -66,6 +67,165 @@ def keep_query_unchanged(reflection: str, reasoning: str) -> str:
     return "UNCHANGED"
 
 
+def extract_refiner_tool_calls(response_msg, content_resp: str) -> List[Dict[str, Any]]:
+    """
+    Extracts refiner tool calls via:
+    1. LangChain native tool_calls
+    2. Markdown fenced JSON
+    3. Sliding-window JSON parser
+    4. Text question extraction
+    """
+    tool_calls_list = []
+    
+    # 1. Native tool calls
+    if hasattr(response_msg, "tool_calls") and response_msg.tool_calls:
+        for tc in response_msg.tool_calls:
+            args = tc.get("args", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            if args:
+                tool_calls_list.append({"name": tc.get("name"), "args": args})
+        if tool_calls_list:
+            return tool_calls_list
+
+    # 2. Markdown fenced JSON
+    md_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content_resp, re.DOTALL)
+    for m in md_matches:
+        try:
+            parsed = json.loads(m.replace(": False", ": false").replace(": True", ": true"))
+            if isinstance(parsed, dict):
+                t_name = parsed.get("name")
+                t_args = parsed.get("arguments", parsed.get("args", parsed.get("parameters", parsed)))
+                if isinstance(t_args, str):
+                    try:
+                        t_args = json.loads(t_args)
+                    except Exception:
+                        pass
+                if not isinstance(t_args, dict):
+                    t_args = parsed
+                if not t_name:
+                    if "sub_queries" in t_args or "queries" in t_args:
+                        t_name = "decompose_query"
+                    elif "rewritten_query" in t_args or "query" in t_args:
+                        t_name = "rewrite_query"
+                    elif "pseudo_document" in t_args or "expansion" in t_args:
+                        t_name = "expand_query"
+                    else:
+                        t_name = "keep_query_unchanged"
+                tool_calls_list.append({"name": t_name, "args": t_args})
+        except Exception:
+            pass
+    if tool_calls_list:
+        return tool_calls_list
+
+    # 3. Sliding-window JSON parser
+    i = 0
+    while i < len(content_resp):
+        if content_resp[i] == '{':
+            brace_level = 0
+            in_string = False
+            escape = False
+            for j in range(i, len(content_resp)):
+                char = content_resp[j]
+                if char == '"' and not escape:
+                    in_string = not in_string
+                if not in_string:
+                    if char == '{':
+                        brace_level += 1
+                    elif char == '}':
+                        brace_level -= 1
+                if brace_level == 0:
+                    try:
+                        json_str = content_resp[i:j+1]
+                        parsed = json.loads(json_str)
+                        if isinstance(parsed, dict):
+                            t_name = parsed.get("name")
+                            t_args = parsed.get("arguments", parsed.get("args", parsed.get("parameters", parsed)))
+                            if isinstance(t_args, str):
+                                try:
+                                    t_args = json.loads(t_args)
+                                except Exception:
+                                    pass
+                            if not isinstance(t_args, dict):
+                                t_args = parsed
+                            
+                            if not t_name:
+                                if "sub_queries" in t_args or "queries" in t_args:
+                                    t_name = "decompose_query"
+                                elif "rewritten_query" in t_args or "query" in t_args:
+                                    t_name = "rewrite_query"
+                                elif "pseudo_document" in t_args or "expansion" in t_args:
+                                    t_name = "expand_query"
+                                else:
+                                    t_name = "keep_query_unchanged"
+                                    
+                            if t_name:
+                                tool_calls_list.append({"name": t_name, "args": t_args})
+                    except Exception:
+                        pass
+                    break
+                if char == '\\':
+                    escape = not escape
+                else:
+                    escape = False
+        i += 1
+    if tool_calls_list:
+        return tool_calls_list
+
+    # 4. Text question extraction fallback (e.g. "1. What is ... ? 2. What is ... ?")
+    numbered_questions = re.findall(r"(?:^|\n)\s*(?:\d+[\.\)]|\-|\*)\s*(.*?\?)", content_resp)
+    if len(numbered_questions) >= 2:
+        clean_qs = [q.strip() for q in numbered_questions if len(q.strip()) > 5]
+        if clean_qs:
+            tool_calls_list.append({
+                "name": "decompose_query",
+                "args": {
+                    "reflection": "Extracted sub-queries from model response text.",
+                    "reasoning": "Decomposed into numbered questions.",
+                    "sub_queries": clean_qs
+                }
+            })
+
+    return tool_calls_list
+
+
+def heuristic_least_to_most(query: str) -> Optional[List[str]]:
+    """
+    Applies deterministic Least-to-Most decomposition (Zhou et al., 2022)
+    when comparative or multi-entity queries are detected.
+    E.g. 'Were X and Y of the same nationality?' ->
+         ['What is the nationality of X?', 'What is the nationality of Y?']
+    """
+    clean_q = query.strip().rstrip("?").strip()
+    pattern = r"^(?:Were|Did|Are|Is)\s+([A-Za-z\s\.]+?)\s+and\s+([A-Za-z\s\.]+?)\s+(?:of the same|share the same|born in the same|in the same)\s+([a-zA-Z\s]+)$"
+    match = re.search(pattern, clean_q, re.IGNORECASE)
+    if match:
+        e1 = match.group(1).strip()
+        e2 = match.group(2).strip()
+        trait = match.group(3).strip()
+        return [
+            f"What is the {trait} of {e1}?",
+            f"What is the {trait} of {e2}?"
+        ]
+        
+    # Pattern 2: "Did X and Y work in the same field?"
+    pattern2 = r"^(?:Did|Were|Are)\s+([A-Za-z\s\.]+?)\s+and\s+([A-Za-z\s\.]+?)\s+both\s+([a-zA-Z\s]+)$"
+    match2 = re.search(pattern2, clean_q, re.IGNORECASE)
+    if match2:
+        e1 = match2.group(1).strip()
+        e2 = match2.group(2).strip()
+        trait = match2.group(3).strip()
+        return [
+            f"Did {e1} {trait}?",
+            f"Did {e2} {trait}?"
+        ]
+
+    return None
+
+
 # --- 2. NODO REFINER ---
 def refiner_node(state: GraphState, llm) -> dict:
     num_ref = state.get("num_refinement", 0)
@@ -92,6 +252,37 @@ CORE OPERATIONAL RULES:
 4. NOISE REMOVAL: If conversational fluff is present, call 'rewrite_query'.
 5. REFLEXION: Use the 'reflection' parameter to critique and address the Validator's feedback.
 
+FEW-SHOT EXAMPLES:
+Example 1 (Comparative query -> decompose_query):
+Query: "Were Marie Curie and Pierre Curie born in the same country?"
+Output:
+```json
+{
+  "name": "decompose_query",
+  "arguments": {
+    "reflection": "The question asks to compare two distinct people; looking up both simultaneously causes mixed search results.",
+    "reasoning": "Decomposing into two parallel atomic sub-queries for each person's birth country.",
+    "sub_queries": [
+      "What was the birth country of Marie Curie?",
+      "What was the birth country of Pierre Curie?"
+    ]
+  }
+}
+```
+
+Example 2 (Atomic factual query -> keep_query_unchanged):
+Query: "When was Albert Einstein born?"
+Output:
+```json
+{
+  "name": "keep_query_unchanged",
+  "arguments": {
+    "reflection": "The query is already a single atomic factual question ready for retrieval.",
+    "reasoning": "No decomposition or rewrite needed."
+  }
+}
+```
+
 CRITICAL INSTRUCTION: Output EXACTLY ONE RAW JSON tool call. Do not add conversational text."""
 
     feedback_history = state.get("feedback_history", [])
@@ -109,83 +300,31 @@ Current Sub-Query to refine: '{q}'{feedback_text}
 
 Analyze the query and feedback, then issue the appropriate JSON tool call."""
 
+        content_resp = ""
         try:
             response_msg = llm_with_tools.invoke([
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt)
             ])
+            content_resp = getattr(response_msg, "content", str(response_msg))
+            tool_calls_list = extract_refiner_tool_calls(response_msg, content_resp)
         except Exception as e:
             print(f"[REFINER ERROR] Errore inferenza per la sub-query: {e}")
-            final_processed_queries.append(q)
-            continue
+            tool_calls_list = []
 
-        tool_calls_list = []
-        
-        # 1. Native tool calls
-        if hasattr(response_msg, "tool_calls") and response_msg.tool_calls:
-            for tc in response_msg.tool_calls:
-                args = tc.get("args", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {}
-                if args:
-                    tool_calls_list.append({"name": tc.get("name"), "args": args})
-
-        # 2. Sliding window JSON parser fallback
+        # Heuristic Least-to-Most Fallback se nessun tool è stato estratto
         if not tool_calls_list:
-            content_resp = getattr(response_msg, "content", str(response_msg))
-            i = 0
-            while i < len(content_resp):
-                if content_resp[i] == '{':
-                    brace_level = 0
-                    in_string = False
-                    escape = False
-                    for j in range(i, len(content_resp)):
-                        char = content_resp[j]
-                        if char == '"' and not escape:
-                            in_string = not in_string
-                        if not in_string:
-                            if char == '{':
-                                brace_level += 1
-                            elif char == '}':
-                                brace_level -= 1
-                        if brace_level == 0:
-                            try:
-                                parsed = json.loads(content_resp[i:j+1])
-                                if isinstance(parsed, dict):
-                                    t_name = parsed.get("name")
-                                    t_args = parsed.get("arguments", parsed.get("args", parsed.get("parameters", parsed)))
-                                    if isinstance(t_args, str):
-                                        try:
-                                            t_args = json.loads(t_args)
-                                        except Exception:
-                                            pass
-                                    if not isinstance(t_args, dict):
-                                        t_args = parsed
-                                    
-                                    if not t_name:
-                                        if "sub_queries" in t_args or "queries" in t_args:
-                                            t_name = "decompose_query"
-                                        elif "rewritten_query" in t_args or "query" in t_args:
-                                            t_name = "rewrite_query"
-                                        elif "pseudo_document" in t_args or "expansion" in t_args:
-                                            t_name = "expand_query"
-                                        else:
-                                            t_name = "keep_query_unchanged"
-                                            
-                                    if t_name:
-                                        tool_calls_list.append({"name": t_name, "args": t_args})
-                            except Exception:
-                                pass
-                            i = j
-                            break
-                        if char == '\\':
-                            escape = not escape
-                        else:
-                            escape = False
-                i += 1
+            heuristic_subs = heuristic_least_to_most(q)
+            if heuristic_subs:
+                print(f"   [REFINER] [Least-to-Most Fallback] Scomposizione euristica applicata per query comparativa.")
+                tool_calls_list = [{
+                    "name": "decompose_query",
+                    "args": {
+                        "reflection": "Heuristic Least-to-Most decomposition of composite comparative query.",
+                        "reasoning": "Splitting comparative query into independent sub-queries.",
+                        "sub_queries": heuristic_subs
+                    }
+                }]
 
         if tool_calls_list:
             decomposed_queries = None
