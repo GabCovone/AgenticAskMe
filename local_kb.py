@@ -463,9 +463,9 @@ def search_index(query: str, top_k: int = 3) -> str:
     STOPWORDS = {
         "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", 
         "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", 
-        "by", "can", "did", "do", "does", "doing", "down", "during", "each", "few", "for", "from", 
-        "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself", "him", 
-        "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just", 
+        "by", "can", "could", "did", "do", "does", "doing", "down", "during", "each", "few", "for", 
+        "from", "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself", 
+        "him", "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just", 
         "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once", 
         "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own", "same", "she", 
         "should", "so", "some", "such", "than", "that", "the", "their", "theirs", "them", "themselves", 
@@ -474,8 +474,29 @@ def search_index(query: str, top_k: int = 3) -> str:
         "why", "with", "would", "you", "your", "yours", "yourself", "yourselves"
     }
 
+    GENERIC_WORDS = {
+        "film", "movie", "films", "movies", "title", "book", "books", "series", "album", "debut",
+        "name", "stage", "person", "people", "woman", "women", "man", "men", "author", "director",
+        "actor", "actress", "position", "government", "city", "country", "place",
+        "arena", "games", "seat", "capacity", "held", "formed", "group", "band", "born", "birth",
+        "located", "location", "neighborhood", "year", "years", "time", "called", "known", "played",
+        "told", "stories", "first", "alien", "species", "world", "worlds", "set", "tell"
+    }
+
+    # Extract capitalized proper nouns or quoted phrases from the query
+    quoted = re.findall(r'"([^"]+)"', query)
+    words = re.findall(r"\b[A-Z][a-zA-Z0-9_\'-]*\b", query)
+    starters = {
+        "What", "Who", "Where", "When", "Why", "How", "Are", "Were", "Was", "Is", "Did", "Do", "Does", "The",
+        "For", "Against", "In", "On", "At", "By", "From", "To", "Of", "With", "And", "Or", "Tell"
+    }
+    capitalized = [w for w in words if w not in starters and w.lower() not in GENERIC_WORDS and w.lower() not in STOPWORDS]
+    named_entities = list(set(quoted + capitalized))
+
     clean_terms = [re.sub(r"[^\w]", "", w) for w in query.lower().split()]
-    content_tokens = [w for w in clean_terms if w and w not in STOPWORDS and len(w) > 2]
+    content_tokens = [w for w in clean_terms if w and w not in STOPWORDS and w not in GENERIC_WORDS and len(w) > 2]
+    if not content_tokens:
+        content_tokens = [w for w in clean_terms if w and w not in STOPWORDS and len(w) > 2]
     if not content_tokens:
         return f"Nessun risultato rilevante trovato nella Knowledge Base locale di Wikipedia per la query: '{query}'."
 
@@ -484,33 +505,31 @@ def search_index(query: str, top_k: int = 3) -> str:
     
     valid_results = []
     for idx in ranked_indices:
-        if scores[idx] >= 1.5:
-            doc = corpus[idx]
-            doc_text = (doc.get("title", "") + " " + doc.get("text", "")).lower()
-            matched = [t for t in content_tokens if t in doc_text]
-            # Deve contenere almeno un termine chiave distintivo o una copertura minima del 35%
-            if len(content_tokens) == 1 and len(matched) == 1:
-                valid_results.append(doc)
-            elif len(matched) >= 2 or (len(matched) / len(content_tokens) >= 0.35):
-                valid_results.append(doc)
+        if scores[idx] < 2.5:
+            continue
+        doc = corpus[idx]
+        title_lower = doc.get("title", "").lower()
+        text_lower = doc.get("text", "").lower()
+        doc_full = f"{title_lower} {text_lower}"
 
-    # Fallback to SQLite FTS5 if BM25 found no solid match
-    if not valid_results:
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            safe_q = " ".join(content_tokens[:4])
-            if safe_q:
-                fts_query = " AND ".join(content_tokens[:3])
-                cur.execute("""
-                SELECT title, text FROM articles_fts WHERE articles_fts MATCH ? ORDER BY rank LIMIT ?
-                """, (fts_query, top_k))
-                rows = cur.fetchall()
-                for title, text in rows:
-                    valid_results.append({"title": title, "text": f"Title: {title}\n{text}"})
-            conn.close()
-        except Exception:
-            pass
+        matched_tokens = [t for t in content_tokens if t in doc_full]
+        coverage = len(matched_tokens) / len(content_tokens) if content_tokens else 0
+
+        # Direct title match: is article title mentioned in query or are title tokens in query?
+        title_words = [tw for tw in re.sub(r"[^\w]", " ", title_lower).split() if len(tw) > 2 and tw not in STOPWORDS and tw not in GENERIC_WORDS]
+        title_in_query = any(tw in content_tokens for tw in title_words) if title_words else (title_lower in query.lower())
+
+        # If entities exist in query, at least one distinctive entity MUST be in the doc
+        if named_entities:
+            ent_match = any(e.lower() in doc_full for e in named_entities)
+            if not ent_match and not title_in_query:
+                continue
+
+        # Require minimum token coverage unless it is a direct title match
+        if not title_in_query and coverage < 0.50:
+            continue
+
+        valid_results.append(doc)
 
     if not valid_results:
         return f"Nessun risultato rilevante trovato nella Knowledge Base locale di Wikipedia per la query: '{query}'."

@@ -56,32 +56,88 @@ def local_kb_search(query: str) -> str:
 
 def search_wikipedia_api(query: str, max_results: int = 3) -> str:
     """
-    Direct Wikipedia Search API (open, reliable, never blocked on Google Colab).
-    HotpotQA is 100% sourced from English Wikipedia.
+    Direct Wikipedia Search and Extract API.
+    1. Generator Search with Plain-Text Extracts (primary): single HTTP request returning rich introductory extracts.
+    2. Fallback to List Search + Extract Fetching.
+    3. Resilient User-Agent and timeout handling.
     """
-    try:
-        import urllib.request, urllib.parse
-        clean_q = clean_query_term(query)
-        if not clean_q or len(clean_q) < 2:
-            return ""
-        encoded_q = urllib.parse.quote(clean_q)
-        url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={encoded_q}&utf8=&format=json&srlimit={max_results}"
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "AgenticIRBenchmark/1.0 (academic HotpotQA evaluation; info-retrieval)"}
-        )
-        with urllib.request.urlopen(req, timeout=4) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            search_items = data.get("query", {}).get("search", [])
-            if search_items:
-                formatted = ""
-                for idx, item in enumerate(search_items):
-                    title = item.get("title", "No Title")
-                    snippet = re.sub(r"<[^>]+>", "", item.get("snippet", "")).strip()
-                    formatted += f"\n--- Wikipedia Result {idx+1}: {title} ---\nTitle: {title}\nSnippet: {snippet}\n"
-                return formatted
-    except Exception:
-        pass
+    import urllib.request, urllib.parse
+    clean_q = clean_query_term(query)
+    if not clean_q or len(clean_q) < 2:
+        return ""
+
+    headers = {
+        "User-Agent": "AgenticIRBenchmarkBot/1.0 (academic HotpotQA evaluation; https://github.com/agentic-ir-research; contact: researcher@university.edu) python-requests/2.31"
+    }
+
+    # Query variations: try the full clean query, and if it's long, also try key named entities / content words
+    search_candidates = [clean_q]
+    q_words = clean_q.split()
+    if len(q_words) > 4:
+        # Extract potential named entity keywords / capitalized tokens
+        caps = [w for w in re.findall(r"\b[A-Za-z0-9_\'-]+\b", query) if w and (w[0].isupper() or any(c.isdigit() for c in w))]
+        starters = {"What", "Who", "Where", "When", "Why", "How", "Are", "Were", "Was", "Is", "Did", "Do", "Does", "The", "In", "On", "At", "By", "For", "From", "To", "Of", "With"}
+        clean_caps = [c for c in caps if c not in starters]
+        if clean_caps:
+            search_candidates.append(" ".join(clean_caps))
+            
+        stopwords = {"what", "who", "where", "when", "why", "how", "are", "were", "was", "is", "did", "do", "does", "the", "a", "an", "and", "or", "in", "on", "at", "by", "for", "from", "to", "of", "with", "that", "this", "which"}
+        content = [w for w in q_words if w.lower() not in stopwords]
+        if content and len(content) < len(q_words):
+            search_candidates.append(" ".join(content[:6]))
+
+    for cand in search_candidates:
+        if not cand or len(cand.strip()) < 2:
+            continue
+        try:
+            encoded_cand = urllib.parse.quote(cand.strip())
+            # Generator query: fetches search rank and plain-text intro extracts in a single call
+            url_gen = (
+                f"https://en.wikipedia.org/w/api.php?action=query&format=json&generator=search&"
+                f"gsrsearch={encoded_cand}&gsrlimit={max_results}&prop=extracts&exintro=1&explaintext=1&redirects=1"
+            )
+            req = urllib.request.Request(url_gen, headers=headers)
+            with urllib.request.urlopen(req, timeout=8) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                pages = data.get("query", {}).get("pages", {})
+                if pages:
+                    # Sort pages by search rank
+                    sorted_pages = sorted(pages.values(), key=lambda p: p.get("index", 999))
+                    formatted = ""
+                    for p in sorted_pages:
+                        title = p.get("title", "")
+                        extract = p.get("extract", "").strip()
+                        if extract:
+                            formatted += f"\n--- Wikipedia Result: {title} ---\nTitle: {title}\nSummary: {extract[:1200]}\n"
+                    if formatted and len(formatted.strip()) > 50:
+                        return formatted
+
+            # Fallback 2: list=search then fetch extracts
+            url_search = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={encoded_cand}&utf8=&format=json&srlimit={max_results}"
+            req_s = urllib.request.Request(url_search, headers=headers)
+            with urllib.request.urlopen(req_s, timeout=8) as response:
+                data_s = json.loads(response.read().decode("utf-8"))
+                items = data_s.get("query", {}).get("search", [])
+                if items:
+                    titles = [it.get("title", "") for it in items if it.get("title")]
+                    if titles:
+                        enc_titles = urllib.parse.quote("|".join(titles))
+                        url_ext = f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&redirects=1&titles={enc_titles}&format=json"
+                        req_e = urllib.request.Request(url_ext, headers=headers)
+                        with urllib.request.urlopen(req_e, timeout=8) as res_e:
+                            data_e = json.loads(res_e.read().decode("utf-8"))
+                            ext_pages = data_e.get("query", {}).get("pages", {})
+                            formatted = ""
+                            for p in ext_pages.values():
+                                t = p.get("title", "")
+                                ext = p.get("extract", "").strip()
+                                if ext:
+                                    formatted += f"\n--- Wikipedia Result: {t} ---\nTitle: {t}\nSummary: {ext[:1200]}\n"
+                            if formatted and len(formatted.strip()) > 50:
+                                return formatted
+        except Exception:
+            continue
+
     return ""
 
 @tool
@@ -126,7 +182,7 @@ def web_search(query: str) -> str:
         resp = requests.get(
             f"https://api.duckduckgo.com/?q={requests.utils.quote(cleaned_q)}&format=json&no_html=1&skip_disambig=1",
             headers=headers,
-            timeout=4
+            timeout=5
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -137,10 +193,7 @@ def web_search(query: str) -> str:
     except Exception:
         pass
 
-    return (
-        f"[WEB SEARCH OFFLINE / NO RESULTS] Could not reach the live web for query '{cleaned_q}'. "
-        "If running in an offline environment, please rely on 'local_kb_search' (local Wikipedia DB)."
-    )
+    return f"Nessun risultato trovato sul web per la query: '{cleaned_q}'."
 
 
 # --- STRATEGY MODEL (ADAPTIVE-RAG) ---
@@ -317,9 +370,9 @@ def planner_node(state: GraphState, llm) -> dict:
 Classify the given query to decide the optimal execution strategy and knowledge source.
 
 SOURCES:
-- 'local_kb': Local Wikipedia Knowledge Base (BM25 + FTS). Prioritize for people, biographies, history, science, cinema, literature, and geography facts.
-- 'web': Live Web Search (DuckDuckGo). Use ONLY for current/live events, contemporary news, or if 'local_kb' returned no results.
-- 'both': Cross-source verification.
+- 'local_kb': Local encyclopedic seed collection (contains ONLY 29 foundational articles on AI, Computer Science, and selected biographies: Scott Derrickson, Ed Wood, Doctor Strange, Alan Turing, Einstein, Newton, Rowling, Curie, Tesla, Rome, Paris). Prioritize ONLY for questions about these specific seed entities or core AI/CS definitions.
+- 'web': Live Web & Full Open Wikipedia Search. Use for ALL other entities, novels, movies, music, history, venues, and any entities not in the 29 seed articles.
+- 'both': Cross-source verification (e.g. check both local seeds and open Wikipedia).
 
 STRATEGIES:
 - 'internal_knowledge': Only if the answer is globally obvious without external retrieval (e.g. capital of France).
@@ -396,8 +449,8 @@ Select the strategy, the retrieval_source ('local_kb' or 'web'), and the optimiz
 Your task is to gather factual evidence to answer the sub-query.
 
 AVAILABLE RETRIEVAL TOOLS:
-1. local_kb_search(query: str): Searches the local Wikipedia Knowledge Base. Best for encyclopedic knowledge, definitions, history, science, films, and biographies.
-2. web_search(query: str): Searches the live web via DuckDuckGo. Best for current events, obscure entities, live websites, or if local KB search returns empty.
+1. local_kb_search(query: str): Searches the local Wikipedia Knowledge Base (contains ONLY 29 seed articles on AI, CS, and selected biographies like Scott Derrickson, Ed Wood, Doctor Strange, Alan Turing).
+2. web_search(query: str): Searches the live web and full English Wikipedia. Use for ALL specific external entities, novels, movies, boy groups, venues, or if 'local_kb_search' returns no relevant results.
 
 PREVIOUSLY RETRIEVED CONTEXT:
 {global_context if global_context else "No prior context."}
@@ -405,15 +458,15 @@ PREVIOUSLY RETRIEVED CONTEXT:
 
 INSTRUCTIONS:
 1. TOOL SELECTION:
-   - Use 'local_kb_search' if the question relates to the general AI, science, or cinema biographies in local storage.
-   - Use 'web_search' if the question relates to specific films, books, venues, current events, or if 'local_kb_search' returns no relevant results.
-   - If 'local_kb_search' does not contain the specific entity, immediately issue a 'web_search' tool call.
+   - Use 'local_kb_search' if the question relates to the 29 seed articles (AI, CS, Scott Derrickson, Ed Wood, Doctor Strange, Alan Turing).
+   - Use 'web_search' for any specific movies, books, venues, bands, or external entities.
+   - CRITICAL: If 'local_kb_search' returns 'Nessun risultato rilevante', the entity is NOT in local storage! You MUST immediately call 'web_search' with the key named entity keywords. DO NOT repeat local search!
 2. Structure your turn as:
    Thought: [Explain your reasoning and justify your choice of tool and search keywords]
     followed immediately by the JSON tool call:
    ```json
    {{
-     "name": "local_kb_search",
+     "name": "web_search",
      "args": {{"query": "your clean keywords here"}}
    }}
    ```
@@ -457,19 +510,13 @@ INSTRUCTIONS:
                                 if t_name == "web_search":
                                     print(f"      [ReAct Action]: web_search -> '{s_query}'")
                                     t_res = web_search.invoke({"query": s_query})
-                                    # Fallback automatico su local_kb se web fallisce
-                                    if "[WEB SEARCH" in t_res:
-                                        print("         [PLANNER] Web search fallita/offline. Tentativo su local_kb_search...")
-                                        t_res_kb = local_kb_search.invoke({"query": s_query})
-                                        if "Nessun risultato rilevante" not in t_res_kb:
-                                            t_res = t_res_kb
                                 else:
                                     print(f"      [ReAct Action]: local_kb_search -> '{s_query}'")
                                     t_res = local_kb_search.invoke({"query": s_query})
                                     if "Nessun risultato rilevante" in t_res:
                                         print("         [PLANNER] Nessun match locale. Tentativo di fallback su web_search...")
                                         t_res_web = web_search.invoke({"query": s_query})
-                                        if "[WEB SEARCH" not in t_res_web:
+                                        if "Nessun risultato" not in t_res_web:
                                             t_res = t_res_web
                                     
                                 preview = str(t_res)[:150].replace('\n', ' ') + "..."
@@ -566,6 +613,10 @@ Provide Reasoning and Final Answer:"""
         print(f"[PLANNER ERROR] Errore sintesi: {e}")
         final_answer = "Errore durante la sintesi della risposta."
 
+    # Clean leading/trailing asterisks or markdown bold formatting
+    final_answer = re.sub(r"^\*+\s*", "", final_answer).strip()
+    final_answer = re.sub(r"\s*\*+$", "", final_answer).strip()
+
     # Intercetta evasioni o dump grezzi di documenti
     evasion_patterns = [
         "don't understand", "do not understand", "please rephrase", "rephrase it",
@@ -586,9 +637,9 @@ Provide Reasoning and Final Answer:"""
             final_answer = "I do not have enough information."
 
     # Controllo di coerenza logica per query comparative Yes/No:
-    # Se il modello ha risposto "No", fallback vuoto o risposta telegrafica priva di spiegazione
+    # Se il modello ha risposto fallback vuoto o mancata sintesi
     is_yes_no_comp = any(w in original_query.lower() for w in ["same", "both", "share"])
-    if is_yes_no_comp and (len(final_answer.strip()) <= 6 or final_answer.lower().startswith("no") or "fallback" in final_answer.lower()):
+    if is_yes_no_comp and (len(final_answer.strip()) == 0 or "fallback" in final_answer.lower() or "unable to generate" in final_answer.lower()):
         all_text = f"{clean_context} {findings_summary} {final_answer}".lower()
         common_nationalities = ["american", "british", "french", "german", "italian", "canadian", "japanese"]
         for nat in common_nationalities:
@@ -601,6 +652,7 @@ Provide Reasoning and Final Answer:"""
     is_polar = any(original_query.strip().lower().startswith(w) for w in ["were ", "was ", "is ", "are ", "did ", "do ", "does ", "can ", "could "]) or any(w in original_query.lower() for w in ["same ", "both "])
     if is_polar and final_answer and not final_answer.startswith("I do not have"):
         ans_clean = final_answer.strip()
+        ans_clean = re.sub(r"^\*+\s*", "", ans_clean).strip()
         first_word = ans_clean.lower().split()[0] if ans_clean else ""
         if first_word not in ["yes", "yes,", "no", "no,"]:
             negation_words = ["not", "never", "neither", "different", "differ", "cannot", "unlike", "no"]
@@ -609,6 +661,8 @@ Provide Reasoning and Final Answer:"""
                 final_answer = f"no, {ans_clean}"
             else:
                 final_answer = f"yes, {ans_clean}"
+        else:
+            final_answer = ans_clean
 
     print(f"[PLANNER] Proposta Final Answer: {final_answer[:160]}...")
     
