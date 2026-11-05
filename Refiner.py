@@ -358,7 +358,7 @@ Analyze the query and feedback, then issue the appropriate JSON tool call."""
                         # Verifica che le sotto-query siano realmente atomiche e separate
                         if is_comp and decomposed_queries:
                             is_still_composite = any(
-                                any(w in sq.lower() for w in ["same", "both", "what about", "as well as", "as ed wood", "as scott"])
+                                any(w in sq.lower() for w in ["same", "both", "what about", "as well as", "either", "neither", "similar", "differ"])
                                 for sq in decomposed_queries
                             ) or any(" and " in sq.lower() for sq in decomposed_queries)
                             if is_still_composite:

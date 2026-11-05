@@ -1,5 +1,12 @@
 import os
 import functools
+import warnings
+
+# Disattiva warning di deprecazione di runtime (incluso datetime.utcnow() di jupyter_client su Python 3.13)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*utcnow.*")
+warnings.filterwarnings("ignore", module=".*jupyter_client.*")
+
 from typing import TypedDict, List, Literal, Optional
 from langgraph.graph import StateGraph, START, END
 from state import GraphState
