@@ -2,10 +2,17 @@ import json
 import ast
 import re
 import sys
+import warnings
+import logging
 from typing import List, Set, Optional, Dict, Any
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage
 from state import GraphState
+
+# Suppress runtime and deprecation warnings
+warnings.filterwarnings("ignore")
+logging.captureWarnings(True)
+logging.getLogger("py.warnings").setLevel(logging.ERROR)
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -107,7 +114,8 @@ def extract_refiner_tool_calls(response_msg, content_resp: str) -> List[Dict[str
                 if not isinstance(t_args, dict):
                     t_args = parsed
                 if not t_name:
-                    if "sub_queries" in t_args or "queries" in t_args:
+                    sub_keys = ["sub_queries", "queries", "subqueries", "sub-queries", "questions", "sub_questions", "subquestions"]
+                    if any(k in t_args for k in sub_keys):
                         t_name = "decompose_query"
                     elif "rewritten_query" in t_args or "query" in t_args:
                         t_name = "rewrite_query"
@@ -153,7 +161,8 @@ def extract_refiner_tool_calls(response_msg, content_resp: str) -> List[Dict[str
                                 t_args = parsed
                             
                             if not t_name:
-                                if "sub_queries" in t_args or "queries" in t_args:
+                                sub_keys = ["sub_queries", "queries", "subqueries", "sub-queries", "questions", "sub_questions", "subquestions"]
+                                if any(k in t_args for k in sub_keys):
                                     t_name = "decompose_query"
                                 elif "rewritten_query" in t_args or "query" in t_args:
                                     t_name = "rewrite_query"
@@ -340,11 +349,17 @@ Analyze the query and feedback, then issue the appropriate JSON tool call."""
             expansion_text = None
             keep_unchanged = False
 
+            is_comp = any(w in q.lower() for w in ["same", "both", "compare", "differ"]) or (" and " in q.lower())
+
             if t_name == "decompose_query":
                 # La scomposizione è valida se la query corrente è composita o se è l'unica query globale
-                is_comp = any(w in q.lower() for w in ["same", "both", "compare", "differ"]) or (" and " in q.lower())
                 if is_comp or len(queries) == 1:
-                    raw_subs = args.get("sub_queries", args.get("queries"))
+                    sub_keys = ["sub_queries", "queries", "subqueries", "sub-queries", "questions", "sub_questions", "subquestions"]
+                    raw_subs = None
+                    for k in sub_keys:
+                        if k in args:
+                            raw_subs = args[k]
+                            break
                     if isinstance(raw_subs, str):
                         try:
                             raw_subs = json.loads(raw_subs)
@@ -375,6 +390,16 @@ Analyze the query and feedback, then issue the appropriate JSON tool call."""
                 expansion_text = args.get("pseudo_document", args.get("expansion", args.get("context")))
             elif t_name == "keep_query_unchanged":
                 keep_unchanged = True
+
+            # Controllo rigoroso Least-to-Most (Zhou et al., 2022):
+            # Se la query è composita e il tool o il modello non hanno prodotto scomposizione valida,
+            # applica deterministicamente la scomposizione Least-to-Most
+            if is_comp and (keep_unchanged or not decomposed_queries):
+                heuristic_subs = heuristic_least_to_most(q)
+                if heuristic_subs:
+                    print("   [REFINER] Applicazione garantita di Least-to-Most per query comparativa.")
+                    decomposed_queries = heuristic_subs
+                    keep_unchanged = False
 
             # Risoluzione delle modifiche
             if decomposed_queries and isinstance(decomposed_queries, list):

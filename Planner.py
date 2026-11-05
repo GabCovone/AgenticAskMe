@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import warnings
+import logging
 from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
@@ -10,8 +11,10 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from state import GraphState
 from local_kb import search_index
 
-# Suppress annoying runtime / deprecation warnings from external search libraries
+# Suppress annoying runtime / deprecation warnings from external search libraries and jupyter_client
 warnings.filterwarnings("ignore")
+logging.captureWarnings(True)
+logging.getLogger("py.warnings").setLevel(logging.ERROR)
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -61,9 +64,14 @@ def web_search(query: str) -> str:
     """
     cleaned_q = clean_query_term(query)
     
-    # 1. Prova con duckduckgo_search / ddgs se installato
+    # 1. Prova con ddgs o duckduckgo_search se installato
     try:
-        from duckduckgo_search import DDGS
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                from duckduckgo_search import DDGS
         with DDGS() as ddgs:
             results = list(ddgs.text(cleaned_q, max_results=3))
             if results:
