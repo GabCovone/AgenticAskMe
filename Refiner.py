@@ -327,48 +327,65 @@ Analyze the query and feedback, then issue the appropriate JSON tool call."""
                 }]
 
         if tool_calls_list:
+            # Considera la prima chiamata tool valida emessa per la sotto-query
+            first_tool = tool_calls_list[0]
+            t_name = first_tool.get("name")
+            tools_used_global.add(t_name)
+            args = first_tool.get("args", {})
+            print(f"   [REFINER REASONING]: {args.get('reasoning', 'No reasoning provided')}")
+            print(f"   [REFINER TOOL CALL]: '{t_name}'")
+
             decomposed_queries = None
             rewritten_query = None
             expansion_text = None
             keep_unchanged = False
-            
-            for tool_call in tool_calls_list:
-                t_name = tool_call.get("name")
-                tools_used_global.add(t_name)
-                args = tool_call.get("args", {})
-                print(f"   [REFINER REASONING]: {args.get('reasoning', 'No reasoning provided')}")
-                print(f"   [REFINER TOOL CALL]: '{t_name}'")
 
-                if t_name == "decompose_query":
-                    decomposed_queries = args.get("sub_queries", args.get("queries"))
-                    if isinstance(decomposed_queries, str):
+            if t_name == "decompose_query":
+                # La scomposizione è valida se la query corrente è composita o se è l'unica query globale
+                is_comp = any(w in q.lower() for w in ["same", "both", "compare", "differ"]) or (" and " in q.lower())
+                if is_comp or len(queries) == 1:
+                    raw_subs = args.get("sub_queries", args.get("queries"))
+                    if isinstance(raw_subs, str):
                         try:
-                            decomposed_queries = json.loads(decomposed_queries)
+                            raw_subs = json.loads(raw_subs)
                         except Exception:
                             try:
-                                decomposed_queries = ast.literal_eval(decomposed_queries)
+                                raw_subs = ast.literal_eval(raw_subs)
                             except Exception:
-                                decomposed_queries = [decomposed_queries]
-                elif t_name == "rewrite_query":
-                    rewritten_query = args.get("rewritten_query", args.get("query"))
-                elif t_name == "expand_query":
-                    expansion_text = args.get("pseudo_document", args.get("expansion", args.get("context")))
-                elif t_name == "keep_query_unchanged":
+                                raw_subs = [raw_subs]
+                    if isinstance(raw_subs, list):
+                        decomposed_queries = [str(s).strip() for s in raw_subs if str(s).strip()]
+                else:
+                    # Se la sotto-query è già atomica, non riscomporla
                     keep_unchanged = True
+            elif t_name == "rewrite_query":
+                rewritten_query = args.get("rewritten_query", args.get("query"))
+            elif t_name == "expand_query":
+                expansion_text = args.get("pseudo_document", args.get("expansion", args.get("context")))
+            elif t_name == "keep_query_unchanged":
+                keep_unchanged = True
 
-            # Risoluzione gerarchica delle modifiche
+            # Risoluzione delle modifiche
             if decomposed_queries and isinstance(decomposed_queries, list):
-                final_processed_queries.extend([str(sq).strip() for sq in decomposed_queries if str(sq).strip()])
+                final_processed_queries.extend(decomposed_queries)
             elif rewritten_query and isinstance(rewritten_query, str):
                 final_processed_queries.append(rewritten_query.strip())
             elif expansion_text and isinstance(expansion_text, str):
                 final_processed_queries.append(f"{q}\n[Expanded Context]: {expansion_text.strip()}")
-            elif keep_unchanged:
-                final_processed_queries.append(q)
             else:
                 final_processed_queries.append(q)
         else:
             final_processed_queries.append(q)
+
+    # Deduplicazione ordinata delle sotto-query per prevenire query ridondanti o duplicate
+    seen = set()
+    deduped_queries = []
+    for sq in final_processed_queries:
+        sq_clean = sq.strip()
+        if sq_clean and sq_clean.lower() not in seen:
+            seen.add(sq_clean.lower())
+            deduped_queries.append(sq_clean)
+    final_processed_queries = deduped_queries if deduped_queries else [current_query_raw]
 
     final_query_str = "\n---\n".join(final_processed_queries)
     if tools_used_global:

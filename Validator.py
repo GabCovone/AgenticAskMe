@@ -158,17 +158,17 @@ def extract_validator_decision(response_msg, content_resp: str) -> Optional[Vali
 
     # 4. Text-based semantic classification fallback
     lower_resp = content_resp.lower()
-    if "finish" in lower_resp or "is_query_answered\": true" in lower_resp or "answered: true" in lower_resp:
+    if "route_to_planning" in lower_resp or "to planning" in lower_resp:
         return ValidatorDecision(
-            reflection="Text fallback indicates answer is completed and verified.",
+            reflection="Text fallback indicates routing to retrieval planning.",
             query_complexity="simple",
-            is_context_relevant=True,
-            is_query_answered=True,
-            reasoning="Extracted finish intent from text.",
-            feedback="None.",
-            next_action="finish"
+            is_context_relevant=False,
+            is_query_answered=False,
+            reasoning="Extracted planning intent from text.",
+            feedback="Search for evidence.",
+            next_action="route_to_planning"
         )
-    elif "route_to_refinement" in lower_resp or "refinement" in lower_resp:
+    elif "route_to_refinement" in lower_resp or "to refinement" in lower_resp:
         return ValidatorDecision(
             reflection="Text fallback suggests query refinement or decomposition.",
             query_complexity="complex",
@@ -177,6 +177,16 @@ def extract_validator_decision(response_msg, content_resp: str) -> Optional[Vali
             reasoning="Extracted refinement intent from text.",
             feedback="Decompose or clarify query.",
             next_action="route_to_refinement"
+        )
+    elif "finish" in lower_resp or "answered" in lower_resp:
+        return ValidatorDecision(
+            reflection="Text fallback indicates answer is completed and verified.",
+            query_complexity="simple",
+            is_context_relevant=True,
+            is_query_answered=True,
+            reasoning="Extracted finish intent from text.",
+            feedback="None.",
+            next_action="finish"
         )
 
     return None
@@ -204,26 +214,11 @@ EVALUATION FRAMEWORK:
    - 'is_query_answered' (IsSup): True ONLY if the retrieved documents fully support the answer. If the answer contains ungrounded guesses or claims not in the context, set False.
 
 3. ROUTING RULES ('next_action'):
+   - 'route_to_planning': Choose for direct factual queries ready for search execution, OR when queries are already decomposed into sub-queries. IF NO DOCUMENTS HAVE BEEN RETRIEVED YET AND THE QUERY IS READY, YOU MUST ROUTE TO 'route_to_planning' TO RETRIEVE FACTS! Never route to refinement simply because context is missing!
+   - 'route_to_refinement': Choose ONLY at the very start (Turn 0: Refinement=0, Planning=0) IF AND ONLY IF the original query is a complex multi-entity comparison that needs decomposition into sub-queries. If the query is already an atomic question, DO NOT choose refinement!
    - 'finish': Choose ONLY if 'is_query_answered' is True AND a valid grounded Final Answer exists. If no context has been retrieved yet, 'finish' is STRICTLY FORBIDDEN!
-   - 'route_to_refinement': Choose if the query asks to compare two entities, check if they share a trait, contains 'and' / 'both' / 'same', or is conversational/ambiguous.
-   - 'route_to_planning': Choose for direct factual queries ready for search execution.
 
-OUTPUT FORMAT:
-Output EXACTLY ONE JSON tool call matching:
-```json
-{
-  "name": "ValidatorDecision",
-  "arguments": {
-    "reflection": "Critique of current retrieval and answers.",
-    "query_complexity": "simple",
-    "is_context_relevant": true,
-    "is_query_answered": true,
-    "reasoning": "Context directly supports the factual answer.",
-    "feedback": "None needed.",
-    "next_action": "finish"
-  }
-}
-```"""
+CRITICAL INSTRUCTION: Output EXACTLY ONE RAW JSON tool call matching ValidatorDecision. Do not output text outside the JSON."""
 
     query_raw = state.get("current_query", state.get("original_query", ""))
     queries = [q.strip() for q in query_raw.split("\n---\n") if q.strip()]
@@ -317,19 +312,26 @@ Evaluate the state and issue your ValidatorDecision JSON."""
                 print("      [ADAPTIVE-RAG ROUTING] Rilevata query comparativa/complessa al turno 0. Instradamento al Refiner (Least-to-Most).")
                 act = "route_to_refinement"
 
-        # 2. Regola Self-RAG (IsSup): Se la risposta non è supportata, non può terminare
+        # 2. Regola Post-Refinement: Se il refinement è già stato eseguito almeno una volta (num_ref > 0)
+        # e non abbiamo ancora effettuato alcun ciclo di planning (num_plan == 0),
+        # il sistema DEVE procedere a planning_node per il recupero delle evidenze!
+        elif num_ref > 0 and num_plan == 0:
+            print("      [POST-REFINEMENT ROUTING] Query già raffinata/decomposta. Instradamento obbligatorio al Planner per il recupero.")
+            act = "route_to_planning"
+
+        # 3. Regola Self-RAG (IsSup): Se la risposta non è supportata, non può terminare
         if act == "finish" and not decision_obj.is_query_answered and num_plan < MAX_PLANNING:
             print("      [SELF-RAG VETO] Risposta non supportata dal contesto (IsSup=False). Reindirizzo al Planner!")
             act = "route_to_planning"
 
-        # 3. Se non è mai stato fatto planning e la risposta è assente o vuota, non si può terminare
+        # 4. Se non è mai stato fatto planning e la risposta è assente o vuota, non si può terminare
         if act == "finish" and num_plan == 0:
             if num_ref == 0:
                 act = "route_to_refinement"
             else:
                 act = "route_to_planning"
 
-        # 4. Limiti massimi di sicurezza per prevenire cicli infiniti
+        # 5. Limiti massimi di sicurezza per prevenire cicli infiniti
         if act == "route_to_refinement" and num_ref >= MAX_REFINEMENT:
             print(f"      [LIMIT REACHED] Raggiunto limite refinement ({MAX_REFINEMENT}). Forzo passaggio a planning.")
             act = "route_to_planning"
