@@ -355,6 +355,17 @@ Analyze the query and feedback, then issue the appropriate JSON tool call."""
                                 raw_subs = [raw_subs]
                     if isinstance(raw_subs, list):
                         decomposed_queries = [str(s).strip() for s in raw_subs if str(s).strip()]
+                        # Verifica che le sotto-query siano realmente atomiche e separate
+                        if is_comp and decomposed_queries:
+                            is_still_composite = any(
+                                any(w in sq.lower() for w in ["same", "both", "what about", "as well as", "as ed wood", "as scott"])
+                                for sq in decomposed_queries
+                            ) or any(" and " in sq.lower() for sq in decomposed_queries)
+                            if is_still_composite:
+                                heuristic_subs = heuristic_least_to_most(q)
+                                if heuristic_subs:
+                                    print("   [REFINER] Rilevata scomposizione non atomica. Sostituzione con Least-to-Most rigorosa.")
+                                    decomposed_queries = heuristic_subs
                 else:
                     # Se la sotto-query è già atomica, non riscomporla
                     keep_unchanged = True

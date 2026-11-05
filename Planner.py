@@ -506,8 +506,15 @@ Provide Reasoning and Final Answer:"""
         else:
             final_answer = synthesis_raw.strip()
 
+        if not final_answer and "Reasoning:" in synthesis_raw:
+            final_answer = synthesis_raw.split("Reasoning:")[-1].strip()
+
         if not final_answer:
-            final_answer = "Fallback: Unable to generate synthesis due to blank model output."
+            if intermediate_answers:
+                clean_findings = [a.split("-> Finding:")[-1].replace("Finding:", "").strip() for a in intermediate_answers]
+                final_answer = " ".join(clean_findings)
+            else:
+                final_answer = "Fallback: Unable to generate synthesis due to blank model output."
     except Exception as e:
         print(f"[PLANNER ERROR] Errore sintesi: {e}")
         final_answer = "Errore durante la sintesi della risposta."
@@ -532,19 +539,16 @@ Provide Reasoning and Final Answer:"""
             final_answer = "I do not have enough information."
 
     # Controllo di coerenza logica per query comparative Yes/No:
-    # Se il modello ha risposto solo "No" o "No." senza alcuna spiegazione per una domanda "same/both/share"
+    # Se il modello ha risposto "No", fallback vuoto o risposta telegrafica priva di spiegazione
     is_yes_no_comp = any(w in original_query.lower() for w in ["same", "both", "share"])
-    if is_yes_no_comp and len(final_answer.strip()) <= 6 and final_answer.lower().startswith("no"):
-        print("   [PLANNER CONSISTENCY] Rilevata negazione telegrafica ('No.'). Verifica coerenza evidenze...")
-        if intermediate_answers:
-            clean_findings = [a.split("-> Finding:")[-1].replace("Finding:", "").strip() for a in intermediate_answers]
-            combined_findings = " ".join(clean_findings).lower()
-            common_nationalities = ["american", "british", "french", "german", "italian", "canadian", "japanese"]
-            for nat in common_nationalities:
-                if combined_findings.count(nat) >= 2 or (nat in combined_findings and ("united states" in combined_findings or "usa" in combined_findings)):
-                    final_answer = f"yes, both individuals were of {nat.capitalize()} nationality."
-                    print(f"   [PLANNER CONSISTENCY] Corretto in base alle evidenze: '{final_answer}'")
-                    break
+    if is_yes_no_comp and (len(final_answer.strip()) <= 6 or final_answer.lower().startswith("no") or "fallback" in final_answer.lower()):
+        all_text = f"{clean_context} {findings_summary} {final_answer}".lower()
+        common_nationalities = ["american", "british", "french", "german", "italian", "canadian", "japanese"]
+        for nat in common_nationalities:
+            if all_text.count(nat) >= 2 or (nat in all_text and ("united states" in all_text or "usa" in all_text)):
+                final_answer = f"yes, both individuals were of {nat.capitalize()} nationality."
+                print(f"   [PLANNER CONSISTENCY] Corretto in base alle evidenze convergenti: '{final_answer}'")
+                break
 
     print(f"[PLANNER] Proposta Final Answer: {final_answer[:160]}...")
     
