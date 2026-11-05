@@ -339,6 +339,8 @@ Analyze the query and feedback, then issue the appropriate JSON tool call."""
             # Considera la prima chiamata tool valida emessa per la sotto-query
             first_tool = tool_calls_list[0]
             t_name = first_tool.get("name")
+            if t_name not in ["decompose_query", "rewrite_query", "expand_query", "keep_query_unchanged"]:
+                t_name = "keep_query_unchanged"
             tools_used_global.add(t_name)
             args = first_tool.get("args", {})
             print(f"   [REFINER REASONING]: {args.get('reasoning', 'No reasoning provided')}")

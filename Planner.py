@@ -54,17 +54,54 @@ def local_kb_search(query: str) -> str:
     except Exception as e:
         return f"Errore ricerca Knowledge Base locale: {str(e)}"
 
+def search_wikipedia_api(query: str, max_results: int = 3) -> str:
+    """
+    Direct Wikipedia Search API (open, reliable, never blocked on Google Colab).
+    HotpotQA is 100% sourced from English Wikipedia.
+    """
+    try:
+        import urllib.request, urllib.parse
+        clean_q = clean_query_term(query)
+        if not clean_q or len(clean_q) < 2:
+            return ""
+        encoded_q = urllib.parse.quote(clean_q)
+        url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={encoded_q}&utf8=&format=json&srlimit={max_results}"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "AgenticIRBenchmark/1.0 (academic HotpotQA evaluation; info-retrieval)"}
+        )
+        with urllib.request.urlopen(req, timeout=4) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            search_items = data.get("query", {}).get("search", [])
+            if search_items:
+                formatted = ""
+                for idx, item in enumerate(search_items):
+                    title = item.get("title", "No Title")
+                    snippet = re.sub(r"<[^>]+>", "", item.get("snippet", "")).strip()
+                    formatted += f"\n--- Wikipedia Result {idx+1}: {title} ---\nTitle: {title}\nSnippet: {snippet}\n"
+                return formatted
+    except Exception:
+        pass
+    return ""
+
 @tool
 def web_search(query: str) -> str:
     """
-    Executes a live search on the open web using DuckDuckGo.
-    Use this tool when the query requires recent information, live websites, real-time data,
-    or when local Wikipedia does not contain the necessary information.
+    Executes a search on the live web / Wikipedia.
+    Use this tool when the query requires specific external knowledge, contemporary entities,
+    live websites, or when local Wikipedia KB does not contain the answer.
     Argument: Natural language search query or keywords.
     """
     cleaned_q = clean_query_term(query)
-    
-    # 1. Prova con ddgs o duckduckgo_search se installato
+    if not cleaned_q or len(cleaned_q) < 2:
+        return "Query non valida o vuota."
+
+    # 1. Prova prima con Wikipedia API (aperta, affidabile su Colab, fonte primaria di HotpotQA)
+    wiki_res = search_wikipedia_api(cleaned_q, max_results=3)
+    if wiki_res and len(wiki_res.strip()) > 30:
+        return wiki_res
+
+    # 2. Prova con ddgs o duckduckgo_search se installato
     try:
         try:
             from ddgs import DDGS
@@ -79,13 +116,10 @@ def web_search(query: str) -> str:
                 for idx, r in enumerate(results):
                     formatted += f"\n--- Web Result {idx+1}: {r.get('title', 'No Title')} ---\nURL: {r.get('href', '')}\nSnippet: {r.get('body', '')}\n"
                 return formatted
-    except ImportError:
+    except Exception:
         pass
-    except Exception as e:
-        # Errore di rete o rate limit da duckduckgo_search
-        return f"[WEB SEARCH WARNING] Network / DuckDuckGo error: {e}. Fallback to local_kb_search suggested."
 
-    # 2. Fallback HTTP minimale tramite duckduckgo instant answer API
+    # 3. Fallback HTTP minimale tramite duckduckgo instant answer API
     try:
         import requests
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -370,7 +404,10 @@ PREVIOUSLY RETRIEVED CONTEXT:
 {feedback_context}
 
 INSTRUCTIONS:
-1. Prioritize 'local_kb_search' for people, cinema, science, and history facts. Use 'web_search' if local KB is empty.
+1. TOOL SELECTION:
+   - Use 'local_kb_search' if the question relates to the general AI, science, or cinema biographies in local storage.
+   - Use 'web_search' if the question relates to specific films, books, venues, current events, or if 'local_kb_search' returns no relevant results.
+   - If 'local_kb_search' does not contain the specific entity, immediately issue a 'web_search' tool call.
 2. Structure your turn as:
    Thought: [Explain your reasoning and justify your choice of tool and search keywords]
     followed immediately by the JSON tool call:
@@ -414,6 +451,8 @@ INSTRUCTIONS:
                                 t_args = t_call.get("args", {})
                                 raw_s_query = t_args.get("query", clean_term) if isinstance(t_args, dict) else clean_term
                                 s_query = clean_query_term(raw_s_query)
+                                if not s_query or len(s_query) < 2:
+                                    s_query = clean_term if (clean_term and len(clean_term) >= 2) else clean_query_term(query)
                                 
                                 if t_name == "web_search":
                                     print(f"      [ReAct Action]: web_search -> '{s_query}'")
@@ -557,6 +596,19 @@ Provide Reasoning and Final Answer:"""
                 final_answer = f"yes, both individuals were of {nat.capitalize()} nationality."
                 print(f"   [PLANNER CONSISTENCY] Corretto in base alle evidenze convergenti: '{final_answer}'")
                 break
+
+    # Regola per query polari Yes/No (allineamento con gold standard HotpotQA):
+    is_polar = any(original_query.strip().lower().startswith(w) for w in ["were ", "was ", "is ", "are ", "did ", "do ", "does ", "can ", "could "]) or any(w in original_query.lower() for w in ["same ", "both "])
+    if is_polar and final_answer and not final_answer.startswith("I do not have"):
+        ans_clean = final_answer.strip()
+        first_word = ans_clean.lower().split()[0] if ans_clean else ""
+        if first_word not in ["yes", "yes,", "no", "no,"]:
+            negation_words = ["not", "never", "neither", "different", "differ", "cannot", "unlike", "no"]
+            is_negated = any(re.search(rf"\b{nw}\b", ans_clean.lower()) for nw in negation_words)
+            if is_negated:
+                final_answer = f"no, {ans_clean}"
+            else:
+                final_answer = f"yes, {ans_clean}"
 
     print(f"[PLANNER] Proposta Final Answer: {final_answer[:160]}...")
     

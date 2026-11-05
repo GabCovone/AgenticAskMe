@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import pickle
+import re
 from typing import List, Dict, Optional
 from rank_bm25 import BM25Okapi
 
@@ -453,31 +454,54 @@ def _get_bm25():
 def search_index(query: str, top_k: int = 3) -> str:
     """
     Searches the local Wikipedia database using BM25 and SQLite FTS5 fallback.
-    Returns formatted snippets of matching documents.
+    Returns formatted snippets of matching documents with strict content token validation.
     """
     bm25, corpus = _get_bm25()
     if not bm25 or not corpus:
         return "Nessun documento presente nella Knowledge Base locale di Wikipedia."
         
-    tokenized_query = query.lower().split()
-    
-    # Score documents using BM25Okapi
-    scores = bm25.get_scores(tokenized_query)
+    STOPWORDS = {
+        "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", 
+        "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", 
+        "by", "can", "did", "do", "does", "doing", "down", "during", "each", "few", "for", "from", 
+        "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself", "him", 
+        "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just", 
+        "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once", 
+        "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own", "same", "she", 
+        "should", "so", "some", "such", "than", "that", "the", "their", "theirs", "them", "themselves", 
+        "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until", 
+        "up", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", 
+        "why", "with", "would", "you", "your", "yours", "yourself", "yourselves"
+    }
+
+    clean_terms = [re.sub(r"[^\w]", "", w) for w in query.lower().split()]
+    content_tokens = [w for w in clean_terms if w and w not in STOPWORDS and len(w) > 2]
+    if not content_tokens:
+        return f"Nessun risultato rilevante trovato nella Knowledge Base locale di Wikipedia per la query: '{query}'."
+
+    scores = bm25.get_scores(content_tokens)
     ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
     
-    # Filter out entries with score 0 if query has no overlap
-    valid_results = [corpus[i] for i in ranked_indices if scores[i] > 0.0]
-    
-    # Fallback to SQLite FTS5 if BM25 tokenized match found nothing
+    valid_results = []
+    for idx in ranked_indices:
+        if scores[idx] >= 1.5:
+            doc = corpus[idx]
+            doc_text = (doc.get("title", "") + " " + doc.get("text", "")).lower()
+            matched = [t for t in content_tokens if t in doc_text]
+            # Deve contenere almeno un termine chiave distintivo o una copertura minima del 35%
+            if len(content_tokens) == 1 and len(matched) == 1:
+                valid_results.append(doc)
+            elif len(matched) >= 2 or (len(matched) / len(content_tokens) >= 0.35):
+                valid_results.append(doc)
+
+    # Fallback to SQLite FTS5 if BM25 found no solid match
     if not valid_results:
         try:
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
-            # Clean query for FTS MATCH
-            safe_q = "".join([c if c.isalnum() or c.isspace() else " " for c in query]).strip()
+            safe_q = " ".join(content_tokens[:4])
             if safe_q:
-                terms = safe_q.split()
-                fts_query = " OR ".join(terms)
+                fts_query = " AND ".join(content_tokens[:3])
                 cur.execute("""
                 SELECT title, text FROM articles_fts WHERE articles_fts MATCH ? ORDER BY rank LIMIT ?
                 """, (fts_query, top_k))
@@ -487,7 +511,7 @@ def search_index(query: str, top_k: int = 3) -> str:
             conn.close()
         except Exception:
             pass
-            
+
     if not valid_results:
         return f"Nessun risultato rilevante trovato nella Knowledge Base locale di Wikipedia per la query: '{query}'."
         
