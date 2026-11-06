@@ -31,8 +31,8 @@ _cached_llm = None
 
 def _preload_cuda_libraries():
     """
-    Risolve il problema di linking dinamico su Linux / Google Colab (libcudart.so.12 / libcublas.so.12)
-    precaricando le librerie condivise di runtime nella tabella globale con ctypes.RTLD_GLOBAL.
+    Risolve il problema di linking dinamico su Linux / Google Colab (libcuda.so.1 / libcudart.so.12 / libcublas.so.12)
+    precaricando le librerie condivise del driver e di runtime nella tabella globale con ctypes.RTLD_GLOBAL.
     """
     import sys
     if not sys.platform.startswith("linux"):
@@ -40,33 +40,77 @@ def _preload_cuda_libraries():
 
     import os, glob, ctypes
 
-    search_dirs = []
-    # 1. Pacchetti Python nvidia.* installati con pip
-    try:
-        import nvidia.cuda_runtime
-        search_dirs.append(os.path.join(nvidia.cuda_runtime.__path__[0], "lib"))
-    except Exception:
-        pass
-        
-    try:
-        import nvidia.cublas
-        search_dirs.append(os.path.join(nvidia.cublas.__path__[0], "lib"))
-    except Exception:
-        pass
-
-    # 2. Percorsi standard CUDA di Linux / Google Colab
-    search_dirs.extend([
+    search_dirs = [
+        "/usr/lib64-nvidia",
+        "/usr/local/cuda/compat",
         "/usr/local/cuda/lib64",
         "/usr/local/cuda-12/lib64",
-        "/usr/lib/x86_64-linux-gnu"
-    ])
-    search_dirs.extend(glob.glob("/usr/local/cuda-12.*/lib64"))
+        "/usr/local/cuda-12/compat",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu/nvidia",
+        "/usr/lib64",
+        "/usr/local/cuda/lib64/stubs",
+    ]
 
-    targets = ["libcublasLt.so.12", "libcublas.so.12", "libcudart.so.12"]
+    # 1. Pacchetti Python nvidia.* installati con pip
+    for pkg in ["nvidia.cuda_runtime", "nvidia.cublas", "nvidia.cuda_nvrtc", "nvidia.cuda_cupti"]:
+        try:
+            mod = __import__(pkg, fromlist=["__path__"])
+            p = os.path.join(mod.__path__[0], "lib")
+            if os.path.isdir(p) and p not in search_dirs:
+                search_dirs.append(p)
+        except Exception:
+            pass
+
+    # 2. Percorsi standard CUDA e driver di Linux / Google Colab
+    search_dirs.extend(glob.glob("/usr/lib64-nvidia*"))
+    search_dirs.extend(glob.glob("/usr/local/cuda*/lib64"))
+    search_dirs.extend(glob.glob("/usr/local/cuda*/compat"))
+    search_dirs.extend(glob.glob("/usr/lib/x86_64-linux-gnu/nvidia*"))
+
+    # Crea un symlink di compatibilità in /tmp/cuda_compat se esiste libcuda.so ma non libcuda.so.1
+    compat_dir = "/tmp/cuda_compat"
+    try:
+        os.makedirs(compat_dir, exist_ok=True)
+        if compat_dir not in search_dirs:
+            search_dirs.insert(0, compat_dir)
+        libcuda_target = os.path.join(compat_dir, "libcuda.so.1")
+        if not os.path.exists(libcuda_target):
+            for d in search_dirs:
+                if not os.path.isdir(d) or d == compat_dir:
+                    continue
+                candidates = glob.glob(os.path.join(d, "libcuda.so*"))
+                real_cands = [c for c in candidates if os.path.exists(os.path.realpath(c))]
+                if real_cands:
+                    try:
+                        os.symlink(real_cands[0], libcuda_target)
+                        break
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # Aggiorna anche os.environ['LD_LIBRARY_PATH'] con tutti i percorsi validi trovati
+    existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
+    valid_dirs = [os.path.abspath(d) for d in search_dirs if os.path.isdir(d)]
+    new_parts = [d for d in valid_dirs if d not in existing_ld.split(":")]
+    if new_parts:
+        os.environ["LD_LIBRARY_PATH"] = ":".join(new_parts) + (":" + existing_ld if existing_ld else "")
+
+    targets = [
+        "libcuda.so.1",
+        "libcuda.so",
+        "libcublasLt.so.12",
+        "libcublasLt.so",
+        "libcublas.so.12",
+        "libcublas.so",
+        "libcudart.so.12",
+        "libcudart.so",
+        "libnvidia-ml.so.1",
+        "libnvidia-ml.so",
+    ]
     loaded = []
-    for d in search_dirs:
-        if not os.path.isdir(d):
-            continue
+    for d in valid_dirs:
         for target in targets:
             fpath = os.path.join(d, target)
             if os.path.exists(fpath) and target not in loaded:
@@ -78,6 +122,8 @@ def _preload_cuda_libraries():
 
     if loaded:
         print(f"[INIT] Librerie CUDA precaricate con successo: {', '.join(loaded)}")
+    elif sys.platform.startswith("linux"):
+        print("[INIT WARNING] Nessuna libreria driver CUDA (libcuda.so.1) trovata. Se sei su Google Colab, assicurati che il tipo di runtime sia impostato su 'T4 GPU' (Runtime -> Cambia tipo di runtime).")
 
 def get_llama_model(model_path: Optional[str] = None, temperature: float = DEFAULT_TEMPERATURE):
     """
@@ -135,30 +181,42 @@ def get_llama_model(model_path: Optional[str] = None, temperature: float = DEFAU
     print(f"[INIT] Caricamento del modello GGUF in memoria da {valid_target_path} (temperature={temperature})...")
     try:
         from langchain_community.chat_models import ChatLlamaCpp
-        try:
-            _cached_llm = ChatLlamaCpp(
-                model_path=valid_target_path,
-                n_gpu_layers=-1,      # Offload completo su GPU (es. CUDA su Google Colab)
-                n_ctx=8192,           # Finestra ampia per RAG multi-hop + grammatica GBNF senza overflow
-                temperature=temperature,
-                max_tokens=512,
-                repeat_penalty=1.05,
-                streaming=False,      # Necessario per applicare la grammatica GBNF (response_format JSON Schema)
-                verbose=False
+        last_error = None
+        for gpu_layers, ctx_len in [(-1, 8192), (33, 8192), (0, 4096)]:
+            tier_name = (
+                "GPU Completo (n_gpu_layers=-1)" if gpu_layers == -1
+                else (f"GPU Parziale (n_gpu_layers={gpu_layers})" if gpu_layers > 0 else "CPU Fallback (n_gpu_layers=0)")
             )
-        except Exception as e_gpu:
-            print(f"[INIT WARNING] Offload n_gpu_layers=-1 fallito ({e_gpu}). Tentativo con n_gpu_layers=33...")
-            _cached_llm = ChatLlamaCpp(
-                model_path=valid_target_path,
-                n_gpu_layers=33,      # Offload parziale sicuro per GPU con VRAM ridotta
-                n_ctx=8192,
-                temperature=temperature,
-                max_tokens=512,
-                repeat_penalty=1.05,
-                streaming=False,      # Necessario per applicare la grammatica GBNF (response_format JSON Schema)
-                verbose=False
-            )
-        return _cached_llm
+            try:
+                _cached_llm = ChatLlamaCpp(
+                    model_path=valid_target_path,
+                    n_gpu_layers=gpu_layers,
+                    n_ctx=ctx_len,
+                    temperature=temperature,
+                    max_tokens=512,
+                    repeat_penalty=1.05,
+                    streaming=False,
+                    verbose=False
+                )
+                print(f"[INIT] Modello LLM caricato con successo in modalità: {tier_name} (n_ctx={ctx_len})!")
+                return _cached_llm
+            except Exception as e_tier:
+                last_error = e_tier
+                print(f"[INIT WARNING] Tentativo {tier_name} fallito: {e_tier}")
+
+        if last_error:
+            err_str = str(last_error)
+            if "libcuda.so" in err_str or "libllama.so" in err_str:
+                print("\n" + "="*70)
+                print("[ERRORE CRITICO: DRIVER GPU NON RILEVATO SU GOOGLE COLAB]")
+                print("Llama-cpp non ha trovato 'libcuda.so.1' sul sistema.")
+                print("La causa è che la sessione di Google Colab è attualmente impostata su CPU.")
+                print("\nCOME RISOLVERE IN 2 CLICK:")
+                print("1. Nel menu in alto di Colab clicca su: Runtime -> Cambia tipo di runtime")
+                print("2. Sotto 'Acceleratore hardware' seleziona: T4 GPU")
+                print("3. Clicca su 'Salva' e riesegui le celle a partire da !nvidia-smi.")
+                print("="*70 + "\n")
+            raise last_error
     except ImportError as e:
         print(f"[INIT WARNING] llama-cpp-python non disponibile nell'ambiente locale: {e}")
         raise
