@@ -8,8 +8,11 @@ warnings.filterwarnings("ignore")
 logging.captureWarnings(True)
 logging.getLogger("py.warnings").setLevel(logging.ERROR)
 
+import importlib
 from typing import TypedDict, List, Literal, Optional
 from langgraph.graph import StateGraph, START, END
+import state as _state_mod
+importlib.reload(_state_mod)
 from state import GraphState
 
 # --- CONFIGURAZIONE CENTRALE DEL MODELLO ---
@@ -138,8 +141,9 @@ def get_llama_model(model_path: Optional[str] = None, temperature: float = DEFAU
                 n_gpu_layers=-1,      # Offload completo su GPU (es. CUDA su Google Colab)
                 n_ctx=4096,           # Finestra di contesto ampia per RAG multi-hop
                 temperature=temperature,
-                max_tokens=2048,
-                repeat_penalty=1.15,
+                max_tokens=1024,
+                repeat_penalty=1.05,
+                streaming=False,      # Necessario per applicare la grammatica GBNF (response_format JSON Schema)
                 verbose=False
             )
         except Exception as e_gpu:
@@ -149,8 +153,9 @@ def get_llama_model(model_path: Optional[str] = None, temperature: float = DEFAU
                 n_gpu_layers=33,      # Offload parziale sicuro per GPU con VRAM ridotta
                 n_ctx=4096,
                 temperature=temperature,
-                max_tokens=2048,
-                repeat_penalty=1.15,
+                max_tokens=1024,
+                repeat_penalty=1.05,
+                streaming=False,      # Necessario per applicare la grammatica GBNF (response_format JSON Schema)
                 verbose=False
             )
         return _cached_llm

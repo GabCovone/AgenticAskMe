@@ -483,15 +483,47 @@ def search_index(query: str, top_k: int = 3) -> str:
         "told", "stories", "first", "alien", "species", "world", "worlds", "set", "tell"
     }
 
-    # Extract capitalized proper nouns or quoted phrases from the query
-    quoted = re.findall(r'"([^"]+)"', query)
-    words = re.findall(r"\b[A-Z][a-zA-Z0-9_\'-]*\b", query)
-    starters = {
-        "What", "Who", "Where", "When", "Why", "How", "Are", "Were", "Was", "Is", "Did", "Do", "Does", "The",
-        "For", "Against", "In", "On", "At", "By", "From", "To", "Of", "With", "And", "Or", "Tell"
+    GEO_ENTITIES = {
+        "united states", "united states of america", "usa", "u.s.", "us", "america", "american",
+        "united kingdom", "uk", "britain", "england", "british", "france", "french",
+        "italy", "italian", "paris", "london", "rome", "washington", "washington, d.c.",
+        "new york", "new york city", "south korea", "south korean", "istanbul", "turkey"
     }
-    capitalized = [w for w in words if w not in starters and w.lower() not in GENERIC_WORDS and w.lower() not in STOPWORDS]
-    named_entities = list(set(quoted + capitalized))
+
+    # Extract quoted phrases and contiguous capitalized proper-noun spans
+    quoted = [q.strip() for q in re.findall(r'["\']([^"\']+)["\']', query) if len(q.strip()) >= 2]
+    q_body = re.sub(
+        r"^(?:What|Who|Where|When|Why|How|Are|Were|Was|Is|Did|Do|Does|Can|Could|Which)\b\s*(?:the\s+)?",
+        "",
+        query.strip(),
+        flags=re.IGNORECASE,
+    )
+    lead_trim = {"The", "A", "An", "In", "On", "At", "By", "From", "To", "Of", "With", "Both", "What", "Who", "Where", "When", "Which"}
+    cap_spans = re.findall(
+        r"\b[A-ZÀ-ÖØ-Þ][a-zA-ZÀ-ÖØ-öø-ÿ0-9_'.-]*(?:\s+[A-ZÀ-ÖØ-Þ][a-zA-ZÀ-ÖØ-öø-ÿ0-9_'.-]*)*",
+        q_body,
+    )
+    extracted_phrases: List[str] = list(quoted)
+    for span in cap_spans:
+        parts = span.split()
+        while parts and parts[0] in lead_trim:
+            parts = parts[1:]
+        if not parts:
+            continue
+        phrase = " ".join(parts).strip(" .,'\"")
+        if len(phrase) < 2:
+            continue
+        if len(parts) == 1 and (phrase.lower() in GENERIC_WORDS or phrase.lower() in STOPWORDS):
+            continue
+        if phrase not in extracted_phrases:
+            extracted_phrases.append(phrase)
+
+    primary_entities = [e for e in extracted_phrases if e.lower() not in GEO_ENTITIES]
+    geo_entities = [e for e in extracted_phrases if e.lower() in GEO_ENTITIES]
+
+    def _has_whole_entity(ent: str, text_lower: str) -> bool:
+        pat = rf"(?<!\w){re.escape(ent.lower())}(?!\w)"
+        return bool(re.search(pat, text_lower))
 
     clean_terms = [re.sub(r"[^\w]", "", w) for w in query.lower().split()]
     content_tokens = [w for w in clean_terms if w and w not in STOPWORDS and w not in GENERIC_WORDS and len(w) > 2]
@@ -515,17 +547,19 @@ def search_index(query: str, top_k: int = 3) -> str:
         matched_tokens = [t for t in content_tokens if t in doc_full]
         coverage = len(matched_tokens) / len(content_tokens) if content_tokens else 0
 
-        # Direct title match: is article title mentioned in query or are title tokens in query?
         title_words = [tw for tw in re.sub(r"[^\w]", " ", title_lower).split() if len(tw) > 2 and tw not in STOPWORDS and tw not in GENERIC_WORDS]
-        title_in_query = any(tw in content_tokens for tw in title_words) if title_words else (title_lower in query.lower())
+        title_in_query = all(tw in content_tokens for tw in title_words) if title_words else _has_whole_entity(title_lower, query.lower())
 
-        # If entities exist in query, at least one distinctive entity MUST be in the doc
-        if named_entities:
-            ent_match = any(e.lower() in doc_full for e in named_entities)
-            if not ent_match and not title_in_query:
+        # If specific non-geographic named entities appear in the query (e.g. 'Local H', 'Scott Derrickson'),
+        # at least one primary entity MUST appear in the document (geographic seed overlap alone is insufficient).
+        if primary_entities:
+            if not any(_has_whole_entity(pe, doc_full) for pe in primary_entities):
+                continue
+        elif geo_entities:
+            if not any(_has_whole_entity(ge, doc_full) for ge in geo_entities):
                 continue
 
-        # Require minimum token coverage unless it is a direct title match
+        # Require minimum token coverage unless full title matches
         if not title_in_query and coverage < 0.50:
             continue
 

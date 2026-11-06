@@ -1,11 +1,9 @@
-import json
-import os
 import re
 import sys
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
-from state import GraphState
+from state import GraphState, invoke_structured_json
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -17,182 +15,108 @@ if hasattr(sys.stdout, "reconfigure"):
 MAX_REFINEMENT = 4
 MAX_PLANNING = 4
 
+
 # --- SCHEMA DI DECISIONE SEMANTICA (SELF-RAG + ADAPTIVE-RAG + REFLEXION) ---
+# Nota sull'ordine dei campi: reflection e reasoning precedono i token booleani e next_action
+# per garantire Chain-of-Thought prima della decisione durante il campionamento GBNF.
 class ValidatorDecision(BaseModel):
-    """USE THIS TOOL to issue the semantic validation and routing decision."""
+    """Semantic validation, Self-RAG critique, and Adaptive-RAG routing decision."""
     reflection: str = Field(
-        description="REFLEXION: Verbal critique of past iterations. Why did previous retrievals fail? Is there hallucination or missing context? How should the next step recover?"
-    )
-    query_complexity: Literal["simple", "complex", "already_decomposed"] = Field(
-        description="ADAPTIVE-RAG: Assess if the query is a simple factoid, a complex multi-hop question, or already decomposed into atomic sub-queries."
-    )
-    is_context_relevant: bool = Field(
-        description="SELF-RAG (IsRel): Determine if the retrieved context is semantically relevant and provides useful facts to answer the question."
-    )
-    is_query_answered: bool = Field(
-        description="SELF-RAG (IsSup): Determine if the proposed answer is strictly supported by the retrieved context without hallucinations."
+        description="REFLEXION: Verbal critique of past iterations. Identify missing entities, retrieval gaps, or potential hallucinations."
     )
     reasoning: str = Field(
-        description="CHAIN OF THOUGHT: Step-by-step logical justification for the routing decision."
+        description="CHAIN OF THOUGHT: Step-by-step logical justification for relevance, support, and routing."
+    )
+    query_complexity: Literal["simple", "complex", "already_decomposed"] = Field(
+        description="ADAPTIVE-RAG: 'simple' for single-entity/bridge lookup, 'complex' for multi-entity comparison needing decomposition, 'already_decomposed' for atomic sub-queries."
+    )
+    is_context_relevant: bool = Field(
+        description="SELF-RAG (IsRel): True if retrieved context contains factual evidence about the target entities."
+    )
+    is_query_answered: bool = Field(
+        description="SELF-RAG (IsSup): True ONLY if the proposed answer is factually supported by the retrieved context without hallucination."
     )
     feedback: str = Field(
-        description="Specific verbal instructions for the next module. For Refiner: suggest decomposition or entity correction. For Planner: suggest explicit keywords or source (local_kb vs web)."
+        description="Actionable instructions for the next node (e.g. which entity or fact is still missing)."
     )
     next_action: Literal["route_to_refinement", "route_to_planning", "finish"] = Field(
-        description="Routing destination: 'route_to_refinement', 'route_to_planning', or 'finish'."
+        description="Routing target: 'route_to_refinement', 'route_to_planning', or 'finish'."
     )
 
 
-def extract_validator_decision(response_msg, content_resp: str) -> Optional[ValidatorDecision]:
-    """
-    Tolerant multi-stage parser for ValidatorDecision:
-    1. LangChain native tool_calls
-    2. Markdown ```json blocks
-    3. Sliding-window JSON parser
-    4. Text-based semantic classification
-    """
-    # 1. Native tool calls
-    if hasattr(response_msg, "tool_calls") and response_msg.tool_calls:
-        t_call = response_msg.tool_calls[0]
-        args = t_call.get("args", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except Exception:
-                args = {}
-        if isinstance(args, dict) and args:
-            try:
-                next_act = str(args.get("next_action", "route_to_planning")).lower().strip()
-                if next_act not in ["route_to_refinement", "route_to_planning", "finish"]:
-                    next_act = "route_to_planning"
-                return ValidatorDecision(
-                    reflection=str(args.get("reflection", "Native tool call critique")),
-                    query_complexity=args.get("query_complexity", "complex"),
-                    is_context_relevant=args.get("is_context_relevant", False) in [True, "true", "True", 1],
-                    is_query_answered=args.get("is_query_answered", False) in [True, "true", "True", 1],
-                    reasoning=str(args.get("reasoning", "Standard reasoning")),
-                    feedback=str(args.get("feedback", "")),
-                    next_action=next_act
-                )
-            except Exception:
-                pass
+def is_comparative_query(q: str) -> bool:
+    """Detects parallel multi-entity comparative queries suited for Least-to-Most decomposition."""
+    ql = q.strip().lower()
+    if any(w in ql for w in ["same ", "both ", "compare ", "differ", "opposed to"]):
+        return True
+    if re.search(r"^(?:who|which\b[^,]*)\s+is\s+(?:older|younger|taller|shorter|larger|smaller|bigger|earlier|later)\b.+\bor\b", ql):
+        return True
+    if re.search(r"^(?:were|are|was|is|did|do|does)\s+.+\s+and\s+.+", ql):
+        return True
+    return False
 
-    # 2. Markdown fenced JSON
-    md_matches = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", content_resp)
-    for m_text in md_matches:
-        try:
-            raw_str = m_text.strip().replace(": False", ": false").replace(": True", ": true")
-            parsed = json.loads(raw_str)
-            if isinstance(parsed, dict):
-                # Reject non-validator tool calls (e.g. local_kb_search or web_search)
-                t_name = parsed.get("name", "")
-                if t_name and t_name not in ["ValidatorDecision", "validator_decision"]:
-                    continue
-                args = parsed.get("arguments", parsed.get("args", parsed.get("parameters", parsed))) if "name" in parsed else parsed
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {}
-                if isinstance(args, dict) and ("next_action" in args or "is_query_answered" in args or "reasoning" in args or "thought" in args or "is_context_relevant" in args):
-                    next_act = str(args.get("next_action", "route_to_planning")).lower().strip()
-                    if next_act not in ["route_to_refinement", "route_to_planning", "finish"]:
-                        next_act = "route_to_planning"
-                    return ValidatorDecision(
-                        reflection=str(args.get("reflection", args.get("critique", "Fenced JSON critique"))),
-                        query_complexity=args.get("query_complexity", "complex"),
-                        is_context_relevant=args.get("is_context_relevant", False) in [True, "true", "True", 1],
-                        is_query_answered=args.get("is_query_answered", False) in [True, "true", "True", 1],
-                        reasoning=str(args.get("reasoning", args.get("thought", args.get("explanation", "Fenced JSON reasoning")))),
-                        feedback=str(args.get("feedback", "")),
-                        next_action=next_act
-                    )
-        except Exception:
-            pass
 
-    # 3. Sliding-window JSON parser
-    i = 0
-    while i < len(content_resp):
-        if content_resp[i] == '{':
-            brace_level = 0
-            in_string = False
-            escape = False
-            for j in range(i, len(content_resp)):
-                char = content_resp[j]
-                if char == '"' and not escape:
-                    in_string = not in_string
-                if not in_string:
-                    if char == '{':
-                        brace_level += 1
-                    elif char == '}':
-                        brace_level -= 1
-                if brace_level == 0:
-                    try:
-                        json_str = content_resp[i:j+1]
-                        json_str = json_str.replace(": False", ": false").replace(": True", ": true")
-                        parsed = json.loads(json_str)
-                        if isinstance(parsed, dict):
-                            args = parsed.get("arguments", parsed.get("args", parsed.get("parameters", parsed))) if "name" in parsed else parsed
-                            if isinstance(args, str):
-                                try:
-                                    args = json.loads(args)
-                                except Exception:
-                                    args = {}
-                            if isinstance(args, dict) and ("next_action" in args or "is_query_answered" in args or "reasoning" in args):
-                                next_act = str(args.get("next_action", "route_to_planning")).lower().strip()
-                                if next_act not in ["route_to_refinement", "route_to_planning", "finish"]:
-                                    next_act = "route_to_planning"
-                                return ValidatorDecision(
-                                    reflection=str(args.get("reflection", "Sliding window extraction")),
-                                    query_complexity=args.get("query_complexity", "complex"),
-                                    is_context_relevant=args.get("is_context_relevant", False) in [True, "true", "True", 1],
-                                    is_query_answered=args.get("is_query_answered", False) in [True, "true", "True", 1],
-                                    reasoning=str(args.get("reasoning", "Extracted CoT")),
-                                    feedback=str(args.get("feedback", "")),
-                                    next_action=next_act
-                                )
-                    except Exception:
-                        pass
-                    break
-                if char == '\\':
-                    escape = not escape
-                else:
-                    escape = False
-        i += 1
+def extract_compared_entities(original_query: str) -> list[str]:
+    """Extracts the two primary entities in comparative questions (if applicable) to verify complete grounding."""
+    clean_q = original_query.strip().rstrip("?").strip()
+    patterns = [
+        r"^(?:Were|Are|Was|Is)\s+(?:the\s+)?(.+?)\s+and\s+(?:the\s+)?(.+?)\s+(?:located\s+in\s+the\s+same|in\s+the\s+same|of\s+the\s+same|born\s+in\s+the\s+same|share\s+the\s+same)\b",
+        r"^(?:Are|Were|Was|Is|Did)\s+(?:the\s+)?(.+?)\s+and\s+(?:the\s+)?(.+?)\s+both\b",
+        r"^Who is (?:older|younger|taller|larger|bigger),\s*(.+?)\s+or\s+(.+?)$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, clean_q, flags=re.IGNORECASE)
+        if m:
+            return [m.group(1).strip(), m.group(2).strip()]
+    return []
 
-    # 4. Text-based semantic classification fallback
-    lower_resp = content_resp.lower()
-    if "route_to_planning" in lower_resp or "to planning" in lower_resp:
+
+def _has_valid_evidence(context: str) -> bool:
+    ctx = (context or "").strip().lower()
+    if len(ctx) < 40:
+        return False
+    has_doc_marker = any(
+        m in ctx for m in ("--- wikipedia result", "--- web result", "--- documento locale", "title:", "search result")
+    )
+    if "nessun risultato" in ctx and not has_doc_marker:
+        return False
+    return True
+
+
+def _text_fallback_decision(content_resp: str, evaluating_final_synthesis: bool) -> Optional[ValidatorDecision]:
+    """Safe text fallback if a non-GBNF mock/custom LLM returns plain text."""
+    # Remove schema field names so 'is_query_answered' never false-matches 'answered'
+    sanitized = re.sub(r"is_query_answered|is_context_relevant|query_complexity|next_action", "", content_resp.lower())
+    if "route_to_refinement" in content_resp.lower() or "to refinement" in sanitized:
         return ValidatorDecision(
-            reflection="Text fallback indicates routing to retrieval planning.",
-            query_complexity="simple",
-            is_context_relevant=False,
-            is_query_answered=False,
-            reasoning="Extracted planning intent from text.",
-            feedback="Search for evidence.",
-            next_action="route_to_planning"
-        )
-    elif "route_to_refinement" in lower_resp or "to refinement" in lower_resp:
-        return ValidatorDecision(
-            reflection="Text fallback suggests query refinement or decomposition.",
+            reflection="Text fallback indicates query decomposition/refinement.",
+            reasoning="Extracted refinement routing intent.",
             query_complexity="complex",
             is_context_relevant=False,
             is_query_answered=False,
-            reasoning="Extracted refinement intent from text.",
-            feedback="Decompose or clarify query.",
-            next_action="route_to_refinement"
+            feedback="Decompose comparative query into atomic sub-queries.",
+            next_action="route_to_refinement",
         )
-    elif "finish" in lower_resp or "answered" in lower_resp:
+    if "route_to_planning" in content_resp.lower() or "to planning" in sanitized:
         return ValidatorDecision(
-            reflection="Text fallback indicates answer is completed and verified.",
+            reflection="Text fallback indicates retrieval planning.",
+            reasoning="Extracted planning routing intent.",
+            query_complexity="simple",
+            is_context_relevant=False,
+            is_query_answered=False,
+            feedback="Retrieve factual evidence.",
+            next_action="route_to_planning",
+        )
+    if evaluating_final_synthesis and re.search(r'\b"finish"\b|\bfinish\b', content_resp.lower()):
+        return ValidatorDecision(
+            reflection="Text fallback indicates synthesis evaluation completed.",
+            reasoning="Extracted finish intent during final synthesis check.",
             query_complexity="simple",
             is_context_relevant=True,
             is_query_answered=True,
-            reasoning="Extracted finish intent from text.",
-            feedback="None.",
-            next_action="finish"
+            feedback="Answer verified.",
+            next_action="finish",
         )
-
     return None
 
 
@@ -201,215 +125,209 @@ def validator_node(state: GraphState, llm) -> dict:
     num_ref = state.get("num_refinement", 0)
     num_plan = state.get("num_planning", 0)
     print(f"\n[VALIDATOR] Avvio ciclo di valutazione e routing (Ref={num_ref}/{MAX_REFINEMENT}, Plan={num_plan}/{MAX_PLANNING})...")
-    
-    llm_with_tools = llm.bind_tools([ValidatorDecision])
-    
+
     query_raw = state.get("current_query", state.get("original_query", ""))
     queries = [q.strip() for q in query_raw.split("\n---\n") if q.strip()]
     if not queries:
         queries = [state.get("original_query", "")]
-        
+
     context = state.get("retrieved_context", "")
     final_answer = state.get("final_answer", "")
-    
-    # Se abbiamo già una Final Answer proposta dal Planner, valutiamo la query originale nel suo insieme
+    original_query = state.get("original_query", "")
+
     evaluating_final_synthesis = bool(final_answer and num_plan > 0)
     if evaluating_final_synthesis:
         print("[VALIDATOR] Valutazione della Proposta Final Answer contro il Contesto (Self-RAG Grounding)...")
-        queries = [state.get("original_query", "")]
-        system_prompt = """You are the Self-RAG Quality Judge and Grounding Evaluator.
-Your task is to evaluate whether the PROPOSED FINAL ANSWER is strictly supported by the RETRIEVED EVIDENCE.
+        queries = [original_query]
+        system_prompt = """You are the Self-RAG Quality Judge and Grounding Evaluator (Asai et al., 2023).
+Evaluate whether the PROPOSED FINAL ANSWER is strictly supported by the RETRIEVED EVIDENCE.
 
-FRAMEWORK (Self-RAG Critique Tokens):
-1. is_context_relevant (IsRel):
-   - True if the retrieved evidence contains factual information about the entities/subject of the question.
-   - False if the evidence is completely unrelated.
+EVALUATION RULES:
+1. is_context_relevant (IsRel): True if the retrieved evidence contains factual information about the entities in the question.
 2. is_query_answered (IsSup):
-   - True if the Proposed Final Answer is directly supported by the retrieved evidence and factually answers the question.
-   - False if the answer is ungrounded, hallucinates, or contradicts the evidence.
+   - True ONLY if the Proposed Final Answer directly answers the question AND every factual claim in it is supported by the Retrieved Evidence.
+   - For comparative questions involving two entities, BOTH entities must have supporting facts in the Retrieved Evidence.
+   - False if the answer hallucinates dates/facts not in the evidence, echoes the question without answering it, or says information is unavailable.
 3. next_action:
-   - 'finish': If is_query_answered is True and the proposed answer is correct and grounded. (ACCEPT ANSWER)
-   - 'route_to_planning': ONLY if critical facts are missing from the evidence and the answer is unsubstantiated.
+   - 'finish' when is_query_answered is True.
+   - 'route_to_planning' when critical evidence is missing or the answer is unsupported.
 
-FEW-SHOT EXAMPLE:
-Question: "Were Marie Curie and Pierre Curie born in the same country?"
-Retrieved Evidence:
---- Document 1: Marie Curie (born Maria Sklodowska) was a Polish-born physicist.
---- Document 2: Pierre Curie was a French physicist born in Paris.
-Proposed Final Answer: No, Marie Curie was born in Poland while Pierre Curie was born in France.
-Output:
-```json
-{
-  "name": "ValidatorDecision",
-  "arguments": {
-    "reflection": "The retrieved evidence explicitly mentions the birth countries of both individuals.",
-    "query_complexity": "simple",
-    "is_context_relevant": true,
-    "is_query_answered": true,
-    "reasoning": "The proposed answer accurately reflects the evidence that Marie Curie was born in Poland and Pierre Curie in France.",
-    "feedback": "Answer fully supported by evidence.",
-    "next_action": "finish"
-  }
-}
-```
-
-CRITICAL INSTRUCTION: Output EXACTLY ONE JSON tool call for ValidatorDecision. If the evidence supports the answer, next_action MUST be 'finish'."""
+Return a single JSON object conforming strictly to the ValidatorDecision schema."""
     else:
-        system_prompt = """You are the Semantic Routing Validator and Quality Judge for an Agentic IR system.
-You enforce the Self-RAG, Adaptive-RAG, and Reflexion theoretical frameworks.
+        system_prompt = """You are the Semantic Routing Validator for an Agentic Information Retrieval system implementing Adaptive-RAG (Jeong et al., 2024), Self-RAG (Asai et al., 2023), and Reflexion (Shinn et al., 2023).
 
-EVALUATION FRAMEWORK:
-1. ADAPTIVE-RAG (Query Complexity):
-   - 'simple': Single atomic question (e.g. "When was X born?"). Route directly to 'route_to_planning'.
-   - 'complex': Ambiguous query, or questions with multiple independent entities being compared (e.g. "Were X and Y born in the same country?"). Route to 'route_to_refinement'.
-   - 'already_decomposed': Multiple sub-queries already split by '---'. Route to 'route_to_planning'.
+ROUTING RULES:
+1. 'route_to_refinement': Choose ONLY at Turn 0 (Refinement=0, Planning=0) when the question compares two independent entities (e.g. "Were X and Y of the same...", "Are X and Y both...", "Who is older, X or Y?") and needs decomposition into sub-queries.
+2. 'route_to_planning': Choose whenever no context has been retrieved yet and the query is atomic or a sequential bridge question, OR when sub-queries are already decomposed. NEVER choose 'finish' when no context has been retrieved!
+3. 'finish': Forbidden before retrieval. Only valid when a grounded Final Answer already exists.
 
-2. SELF-RAG CRITIQUE TOKENS:
-   - 'is_context_relevant' (IsRel): True if the retrieved documents contain facts related to the query; False if unrelated.
-   - 'is_query_answered' (IsSup): True ONLY if the retrieved documents fully support the answer. If the answer contains ungrounded guesses or claims not in the context, set False.
+Return a single JSON object conforming strictly to the ValidatorDecision schema."""
 
-3. ROUTING RULES ('next_action'):
-   - 'route_to_planning': Choose for direct factual queries ready for search execution, OR when queries are already decomposed into sub-queries. IF NO DOCUMENTS HAVE BEEN RETRIEVED YET AND THE QUERY IS READY, YOU MUST ROUTE TO 'route_to_planning' TO RETRIEVE FACTS! Never route to refinement simply because context is missing!
-   - 'route_to_refinement': Choose ONLY at the very start (Turn 0: Refinement=0, Planning=0) IF AND ONLY IF the original query is a complex multi-entity comparison that needs decomposition into sub-queries. If the query is already an atomic question, DO NOT choose refinement!
-   - 'finish': Choose ONLY if 'is_query_answered' is True AND a valid grounded Final Answer exists. If no context has been retrieved yet, 'finish' is STRICTLY FORBIDDEN!
-
-CRITICAL INSTRUCTION: Output EXACTLY ONE RAW JSON tool call matching ValidatorDecision. Do not output text outside the JSON."""
-
-    eval_context = context if context else "No context retrieved yet."
+    eval_context = context[:3000] if context else "No context retrieved yet."
     feedbacks = []
     actions = []
-    
+
     for q_idx, q in enumerate(queries):
         if not evaluating_final_synthesis:
             print(f"[VALIDATOR] Analisi sotto-query {q_idx+1}/{len(queries)}: '{q}'")
-            user_prompt = f"""Original User Request: '{state.get('original_query', '')}'
+            user_prompt = f"""Original User Request: '{original_query}'
 Sub-Query under evaluation: '{q}'
-Current Retrieved Context / Answer:
+Current Retrieved Context:
 {eval_context}
 
 Metrics: Refinement Count={num_ref}/{MAX_REFINEMENT}, Planning Count={num_plan}/{MAX_PLANNING}
 
-Evaluate the state and issue your ValidatorDecision JSON."""
+Issue your ValidatorDecision JSON."""
         else:
-            user_prompt = f"""QUESTION: '{state.get('original_query', '')}'
+            user_prompt = f"""QUESTION: '{original_query}'
 
 RETRIEVED EVIDENCE:
-{context}
+{eval_context}
 
-PROPOSED FINAL ANSWER TO EVALUATE:
+PROPOSED FINAL ANSWER:
 {final_answer}
 
-Verify if the PROPOSED FINAL ANSWER is supported by the RETRIEVED EVIDENCE and output your ValidatorDecision JSON:"""
+Verify strict factual support and issue your ValidatorDecision JSON."""
 
+        decision_obj = None
         content_resp = ""
         try:
-            response_msg = llm_with_tools.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_prompt)
-            ])
-            content_resp = getattr(response_msg, "content", str(response_msg))
-            decision_obj = extract_validator_decision(response_msg, content_resp)
+            decision_obj, content_resp = invoke_structured_json(
+                llm,
+                ValidatorDecision,
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt),
+                ],
+            )
+            if decision_obj is None and content_resp:
+                decision_obj = _text_fallback_decision(content_resp, evaluating_final_synthesis)
         except Exception as e:
             print(f"[VALIDATOR ERROR] Errore inferenza: {e}")
             decision_obj = None
 
-        # Fallback intelligente e rigoroso se nessun JSON è stato prodotto
+        # Fallback deterministico di sicurezza
         if not decision_obj:
-            print("[VALIDATOR] JSON non riconosciuto. Applico fallback euristico rigoroso.")
+            print("[VALIDATOR] Applico fallback deterministico di sicurezza.")
             if evaluating_final_synthesis:
-                # Controlla se la risposta sintetizzata è valida e non un messaggio di errore/insufficienza
-                failure_words = [
-                    "not enough", "enough information", "unable to", "cannot be answered", "errore",
-                    "fallback", "do not have", "don't have", "no evidence", "not possible", "cannot determine",
-                    "not explicitly", "i do not have", "no specific"
-                ]
-                has_substance = len(final_answer.strip()) >= 10 and not any(w in final_answer.lower() for w in failure_words)
-                is_supported = has_substance and bool(context)
-                
+                has_ev = _has_valid_evidence(context)
                 decision_obj = ValidatorDecision(
-                    reflection="Evaluating synthesized answer against context.",
+                    reflection="Deterministic evaluation of synthesized answer against retrieved context.",
+                    reasoning="Checking answer substance and evidence presence.",
                     query_complexity="simple",
-                    is_context_relevant=bool(context),
-                    is_query_answered=is_supported,
-                    reasoning="Synthesized answer is present and grounded in retrieved evidence." if is_supported else "Synthesized answer lacks sufficient grounding.",
-                    feedback="Answer complete." if is_supported else "Retrieve more evidence for missing entities.",
-                    next_action="finish" if is_supported else ("route_to_planning" if num_plan < MAX_PLANNING else "finish")
+                    is_context_relevant=has_ev,
+                    is_query_answered=has_ev,
+                    feedback="Answer verified." if has_ev else "Missing supporting evidence in retrieved context.",
+                    next_action="finish" if has_ev else ("route_to_planning" if num_plan < MAX_PLANNING else "finish"),
                 )
             else:
-                is_composite = any(w in q.lower() for w in ["same", "both", "compare", "differ"]) or (" and " in q.lower())
-                next_act = "route_to_refinement" if (num_ref == 0 and is_composite) else "route_to_planning"
+                comp = is_comparative_query(q) and len(queries) == 1
+                next_act = "route_to_refinement" if (num_ref == 0 and num_plan == 0 and comp) else "route_to_planning"
                 decision_obj = ValidatorDecision(
-                    reflection="Turn 0 evaluation: routing to refinement or planning.",
-                    query_complexity="complex" if is_composite else "simple",
+                    reflection="Initial routing assessment.",
+                    reasoning="Routing based on query structure and retrieval state.",
+                    query_complexity="complex" if comp else ("already_decomposed" if len(queries) > 1 else "simple"),
                     is_context_relevant=bool(context),
                     is_query_answered=False,
-                    reasoning="Heuristic routing based on query complexity.",
-                    feedback="Proceed with refinement/planning.",
-                    next_action=next_act
+                    feedback="Decompose comparative query." if next_act == "route_to_refinement" else "Execute retrieval plan.",
+                    next_action=next_act,
                 )
 
-        print(f"      [REASONING]: {decision_obj.reasoning[:120]}...")
+        print(f"      [REASONING]: {decision_obj.reasoning[:140]}...")
         print(f"      [SELF-RAG CRITIQUE]: IsRel={decision_obj.is_context_relevant} | IsSup={decision_obj.is_query_answered}")
         print(f"      [ACTION LLM]: {decision_obj.next_action.upper()}")
 
-        # --- RIGOROSA APPLICAZIONE DEI FRAMEWORK ACCADEMICI SUL ROUTING ---
         act = decision_obj.next_action
 
-        # Controllo Grounding Deterministico per la sintesi finale (Self-RAG Grounding Verification)
+        # --- VERIFICA DETERMINISTICA DI GROUNDING SULLA FINAL ANSWER (SELF-RAG) ---
         if evaluating_final_synthesis:
-            ans_lower = final_answer.lower()
-            ctx_lower = context.lower()
+            ans_stripped = final_answer.strip()
+            ans_lower = ans_stripped.lower()
+            ctx_lower = (context or "").lower()
+            ctx_digits_norm = ctx_lower.replace(",", "")
+            ans_digits_norm = ans_lower.replace(",", "")
+
             failure_words = [
                 "unable to", "cannot", "don't know", "not enough", "enough information",
                 "do not have", "don't have", "no evidence", "not possible", "cannot determine",
-                "cannot be determined", "fallback", "error", "not explicitly", "no specific",
-                "it appears that", "i do not have"
+                "cannot be determined", "fallback", "errore durante", "not explicitly", "no specific",
+                "i do not have", "unknown"
             ]
-            is_substantive = len(final_answer.strip()) >= 10 and not any(w in ans_lower for w in failure_words)
-            
-            # Estrae parole chiave significative della risposta e verifica se sono presenti nel contesto
-            words_in_answer = [w for w in re.findall(r'\b[a-zA-Z]{4,}\b', ans_lower) if w not in ["both", "were", "with", "from", "that", "this", "have", "been", "individual", "individuals", "nationality", "located"]]
-            grounded_words = [w for w in words_in_answer if w in ctx_lower]
-            grounding_ratio = len(grounded_words) / len(words_in_answer) if words_in_answer else 0
-            
-            if is_substantive and (grounding_ratio >= 0.25 or (decision_obj.is_query_answered and bool(context))):
-                print(f"      [SELF-RAG GROUNDING CHECK] Risposta verificata e pienamente supportata dal contesto (grounding ratio: {grounding_ratio:.2f}).")
+            # Concise entity/number/polar answers (e.g. 'yes', 'no', 'Animorphs', '3,677 seated') are valid (>=2 chars),
+            # whereas echoed questions ending in '?' or failure phrases are rejected.
+            is_echoed_question = ans_stripped.endswith("?")
+            is_substantive = (
+                len(ans_stripped) >= 2
+                and not is_echoed_question
+                and not any(w in ans_lower for w in failure_words)
+            )
+            has_evidence = _has_valid_evidence(context)
+
+            # Per domande comparative a 2 entità, verifica che entrambe siano state recuperate nel contesto
+            compared_ents = extract_compared_entities(original_query)
+            missing_ents = []
+            for ent in compared_ents:
+                ent_tokens = [t.lower() for t in re.findall(r"\w{3,}", ent)]
+                if ent_tokens and not any(tok in ctx_lower for tok in ent_tokens):
+                    missing_ents.append(ent)
+
+            # Verifica overlap dei token fattuali della risposta con il contesto
+            is_polar_ans = bool(re.match(r"^(?:yes|no)\b", ans_lower))
+            stop_ans = {
+                "yes", "no", "the", "and", "both", "were", "was", "are", "is", "from", "with",
+                "that", "this", "have", "been", "same", "located", "born", "nationality", "older", "younger"
+            }
+            ans_tokens = [
+                w for w in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ0-9]{2,}", ans_digits_norm)
+                if w not in stop_ans
+            ]
+            grounded_tokens = [w for w in ans_tokens if w in ctx_digits_norm]
+            grounding_ratio = (len(grounded_tokens) / len(ans_tokens)) if ans_tokens else (1.0 if is_polar_ans and has_evidence else 0.0)
+
+            if not is_substantive or not has_evidence:
+                print("      [SELF-RAG GROUNDING CHECK] Risposta elusiva, interrogativa o priva di evidenze. Reindirizzo al Planner.")
+                decision_obj.is_query_answered = False
+                decision_obj.feedback = "Previous answer was empty, interrogative, or lacked retrieved evidence. Retrieve missing facts via web_search."
+                act = "route_to_planning"
+            elif missing_ents:
+                print(f"      [SELF-RAG GROUNDING CHECK] Evidenze mancanti per entità comparate: {missing_ents}. Reindirizzo al Planner.")
+                decision_obj.is_query_answered = False
+                decision_obj.feedback = f"Missing retrieved evidence for: {', '.join(missing_ents)}. Search explicitly for {', '.join(missing_ents)}."
+                act = "route_to_planning"
+            elif not is_polar_ans and ans_tokens and grounding_ratio == 0.0:
+                print("      [SELF-RAG GROUNDING CHECK] Nessun token della risposta trovato nel contesto recuperato (possibile allucinazione). Reindirizzo al Planner.")
+                decision_obj.is_query_answered = False
+                decision_obj.feedback = f"Proposed answer '{ans_stripped}' is not grounded in retrieved text. Search for explicit supporting evidence."
+                act = "route_to_planning"
+            elif grounding_ratio >= 0.5 or (is_polar_ans and decision_obj.is_query_answered) or (ans_digits_norm in ctx_digits_norm):
+                print(f"      [SELF-RAG GROUNDING CHECK] Risposta verificata e supportata dal contesto (grounding ratio: {grounding_ratio:.2f}).")
                 decision_obj.is_context_relevant = True
                 decision_obj.is_query_answered = True
                 act = "finish"
-            elif not is_substantive:
-                print("      [SELF-RAG GROUNDING CHECK] Risposta insufficiente o vuota. Reindirizzo al Planner.")
+
+        # 1. Regola Adaptive-RAG al Turno 0: instrada query comparative multi-entità al Refiner (Least-to-Most)
+        if num_ref == 0 and num_plan == 0:
+            if is_comparative_query(q):
+                print("      [ADAPTIVE-RAG ROUTING] Rilevata query comparativa multi-entità al turno 0. Instradamento al Refiner (Least-to-Most).")
+                act = "route_to_refinement"
+            else:
                 act = "route_to_planning"
 
-        # 1. Regola Adaptive-RAG: Al turno 0 (nessun refinement ancora eseguito),
-        # se la query è comparativa o composita (es. "Were X and Y born in same country?"),
-        # deve essere instradata al Refiner per la scomposizione Least-to-Most (Zhou et al., 2022)
-        if num_ref == 0 and num_plan == 0:
-            is_composite = any(w in q.lower() for w in ["same", "both", "compare", "differ", "opposed to"]) or (" and " in q.lower())
-            if is_composite or decision_obj.query_complexity == "complex":
-                print("      [ADAPTIVE-RAG ROUTING] Rilevata query comparativa/complessa al turno 0. Instradamento al Refiner (Least-to-Most).")
-                act = "route_to_refinement"
-
-        # 2. Regola Post-Refinement: Se il refinement è già stato eseguito almeno una volta (num_ref > 0)
-        # e non abbiamo ancora effettuato alcun ciclo di planning (num_plan == 0),
-        # il sistema DEVE procedere a planning_node per il recupero delle evidenze!
+        # 2. Regola Post-Refinement: dopo il refinement iniziale, procedi obbligatoriamente al recupero nel Planner
         elif num_ref > 0 and num_plan == 0:
-            print("      [POST-REFINEMENT ROUTING] Query già raffinata/decomposta. Instradamento obbligatorio al Planner per il recupero.")
+            print("      [POST-REFINEMENT ROUTING] Query già raffinata/decomposta. Instradamento obbligatorio al Planner.")
             act = "route_to_planning"
 
-        # 3. Regola Self-RAG (IsSup): Se la risposta non è supportata, non può terminare
+        # 3. Regola Self-RAG (IsSup): se non supportata e sotto il limite di planning, torna al Planner
         if act == "finish" and not decision_obj.is_query_answered and num_plan < MAX_PLANNING:
             print("      [SELF-RAG VETO] Risposta non supportata dal contesto (IsSup=False). Reindirizzo al Planner!")
             act = "route_to_planning"
 
-        # 4. Se non è mai stato fatto planning e la risposta è assente o vuota, non si può terminare
+        # 4. Impedisci finish prematuro senza alcun ciclo di planning
         if act == "finish" and num_plan == 0:
-            if num_ref == 0:
-                act = "route_to_refinement"
-            else:
-                act = "route_to_planning"
+            act = "route_to_refinement" if (num_ref == 0 and is_comparative_query(q)) else "route_to_planning"
 
-        # 5. Limiti massimi di sicurezza per prevenire cicli infiniti
+        # 5. Limiti massimi contro loop infiniti
         if act == "route_to_refinement" and num_ref >= MAX_REFINEMENT:
             print(f"      [LIMIT REACHED] Raggiunto limite refinement ({MAX_REFINEMENT}). Forzo passaggio a planning.")
             act = "route_to_planning"
@@ -423,7 +341,6 @@ Verify if the PROPOSED FINAL ANSWER is supported by the RETRIEVED EVIDENCE and o
             if decision_obj.reflection:
                 feedbacks.append(f"Reflection: {decision_obj.reflection}")
 
-    # Aggregazione delle azioni per il grafo
     if "route_to_refinement" in actions:
         overall_action = "route_to_refinement"
     elif "route_to_planning" in actions:
@@ -433,16 +350,13 @@ Verify if the PROPOSED FINAL ANSWER is supported by the RETRIEVED EVIDENCE and o
 
     print(f"[VALIDATOR] Instradamento globale verso nodo: {overall_action.upper()}\n")
 
-    # Mantenimento o reset dello stato
     state_update = {
         "next_node": overall_action,
-        "feedback_history": feedbacks
+        "feedback_history": feedbacks,
     }
 
-    # Se avevamo una final answer ma il Validator l'ha bocciata (Self-RAG IsSup=False o action != finish)
     if final_answer and overall_action != "finish":
         print("[VALIDATOR] Final Answer respinta dal controllo Self-RAG. Resetto e chiedo nuova ricerca.")
         state_update["final_answer"] = ""
 
     return state_update
-

@@ -1,15 +1,15 @@
-import json
 import ast
+import json
+import logging
 import re
 import sys
 import warnings
-import logging
-from typing import List, Set, Optional, Dict, Any
+from typing import Any, Dict, List, Literal, Optional, Set
+from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage
-from state import GraphState
+from state import GraphState, invoke_structured_json
 
-# Suppress runtime and deprecation warnings
 warnings.filterwarnings("ignore")
 logging.captureWarnings(True)
 logging.getLogger("py.warnings").setLevel(logging.ERROR)
@@ -20,65 +20,64 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+
 # --- 1. DEFINIZIONE DEI TOOL DI REFINEMENT ---
 
 @tool
 def decompose_query(reflection: str, reasoning: str, sub_queries: List[str]) -> List[str]:
     """
-    Applies the 'Least-to-Most Prompting' framework (Zhou et al., 2022) to decompose a complex query
-    into simpler, logically sequential or parallel sub-questions.
-    WHEN TO USE:
-    - Queries that compare two or more entities (e.g. "Were X and Y born in the same country?").
-    - Multi-hop questions with multiple independent facts needed to construct the final answer.
-    ARGUMENTS:
-    - reflection: Critique of previous attempts based on the Validator's feedback.
-    - reasoning: Step-by-step reasoning explaining why and how the query is broken down.
-    - sub_queries: A list of clean, self-contained sub-questions. Do NOT drop explicit named entities!
+    Applies 'Least-to-Most Prompting' (Zhou et al., 2022) to decompose a complex comparative
+    or multi-entity query into independent, self-contained atomic sub-questions.
     """
     return sub_queries
+
 
 @tool
 def expand_query(reflection: str, reasoning: str, pseudo_document: str) -> str:
     """
-    Applies the 'Query2doc' framework (Wang et al., 2023) for semantic query expansion.
-    WHEN TO USE:
-    - Queries that are short, telegraphic, or lack background vocabulary for BM25/retrieval.
-    ARGUMENTS:
-    - reflection: Critique of previous attempts.
-    - reasoning: Explanation of which domain concepts need expansion.
-    - pseudo_document: A synthetic, factual passage generated from model knowledge to enrich retrieval vocabulary.
+    Applies 'Query2doc' (Wang et al., 2023) for semantic query expansion on short or telegraphic queries.
     """
     return pseudo_document
+
 
 @tool
 def rewrite_query(reflection: str, reasoning: str, rewritten_query: str) -> str:
     """
-    Applies the 'Rewrite-Retrieve-Read' framework (Ma et al., 2023) for syntactic and entity correction.
-    WHEN TO USE:
-    - Queries with conversational filler ("hey can you tell me...", "I was wondering..."), typos, or ambiguous syntax.
-    ARGUMENTS:
-    - reflection: Critique of past attempts.
-    - reasoning: Justification for the rewrites.
-    - rewritten_query: The cleaned, search-engine-optimized query. ALWAYS preserve explicit named entities!
+    Applies 'Rewrite-Retrieve-Read' (Ma et al., 2023) to remove conversational noise while preserving named entities.
     """
     return rewritten_query
+
 
 @tool
 def keep_query_unchanged(reflection: str, reasoning: str) -> str:
     """
-    Use this tool when the query is already atomic, unambiguous, and ready for retrieval without modification.
-    ARGUMENTS:
-    - reflection: Acknowledgement of current state and Validator feedback.
-    - reasoning: Justification for keeping the query in its current form.
+    Keeps the query unchanged when it is already atomic and ready for retrieval.
     """
     return "UNCHANGED"
 
 
+# Schema GBNF piatto per garantire output JSON deterministico su ChatLlamaCpp
+class RefinerDecision(BaseModel):
+    """Structured query refinement decision selecting one of the four academic reformulation tools."""
+    reflection: str = Field(
+        description="Critique of current query complexity and Validator feedback."
+    )
+    reasoning: str = Field(
+        description="Step-by-step justification for decomposing, rewriting, expanding, or keeping the query."
+    )
+    tool_name: Literal["decompose_query", "rewrite_query", "expand_query", "keep_query_unchanged"] = Field(
+        description="Selected refinement tool."
+    )
+    sub_queries: List[str] = Field(
+        description="List of atomic self-contained sub-questions when tool_name is 'decompose_query' (empty list [] otherwise). Preserve exact entity spelling!"
+    )
+    rewritten_text: str = Field(
+        description="Rewritten query or Query2doc pseudo-passage when tool_name is 'rewrite_query' or 'expand_query' (empty string '' otherwise)."
+    )
+
+
 def clean_subquery_text(s: str) -> str:
-    """
-    Strips markdown artifacts, numbering, and sub-query labels from generated queries.
-    E.g. '*Sub-query 1:** What is ...?' -> 'What is ...?'
-    """
+    """Strips markdown bullets, numbering, and sub-query labels from generated sub-questions."""
     if not isinstance(s, str):
         s = str(s)
     s = re.sub(r"^\*+\s*", "", s).strip()
@@ -89,159 +88,27 @@ def clean_subquery_text(s: str) -> str:
     return s.strip()
 
 
-def extract_refiner_tool_calls(response_msg, content_resp: str) -> List[Dict[str, Any]]:
+def heuristic_least_to_most_with_entities(query: str) -> tuple[Optional[List[str]], List[str]]:
     """
-    Extracts refiner tool calls via:
-    1. LangChain native tool_calls
-    2. Markdown fenced JSON
-    3. Sliding-window JSON parser
-    4. Text question extraction
-    """
-    tool_calls_list = []
-    
-    # 1. Native tool calls
-    if hasattr(response_msg, "tool_calls") and response_msg.tool_calls:
-        for tc in response_msg.tool_calls:
-            args = tc.get("args", {})
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    args = {}
-            if args:
-                tool_calls_list.append({"name": tc.get("name"), "args": args})
-        if tool_calls_list:
-            return tool_calls_list
-
-    # 2. Markdown fenced JSON
-    md_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content_resp, re.DOTALL)
-    for m in md_matches:
-        try:
-            parsed = json.loads(m.replace(": False", ": false").replace(": True", ": true"))
-            if isinstance(parsed, dict):
-                t_name = parsed.get("name")
-                t_args = parsed.get("arguments", parsed.get("args", parsed.get("parameters", parsed)))
-                if isinstance(t_args, str):
-                    try:
-                        t_args = json.loads(t_args)
-                    except Exception:
-                        pass
-                if not isinstance(t_args, dict):
-                    t_args = parsed
-                if not t_name:
-                    sub_keys = ["sub_queries", "queries", "subqueries", "sub-queries", "questions", "sub_questions", "subquestions"]
-                    if any(k in t_args for k in sub_keys):
-                        t_name = "decompose_query"
-                    elif "rewritten_query" in t_args or "query" in t_args:
-                        t_name = "rewrite_query"
-                    elif "pseudo_document" in t_args or "expansion" in t_args:
-                        t_name = "expand_query"
-                    else:
-                        t_name = "keep_query_unchanged"
-                tool_calls_list.append({"name": t_name, "args": t_args})
-        except Exception:
-            pass
-    if tool_calls_list:
-        return tool_calls_list
-
-    # 3. Sliding-window JSON parser
-    i = 0
-    while i < len(content_resp):
-        if content_resp[i] == '{':
-            brace_level = 0
-            in_string = False
-            escape = False
-            for j in range(i, len(content_resp)):
-                char = content_resp[j]
-                if char == '"' and not escape:
-                    in_string = not in_string
-                if not in_string:
-                    if char == '{':
-                        brace_level += 1
-                    elif char == '}':
-                        brace_level -= 1
-                if brace_level == 0:
-                    try:
-                        json_str = content_resp[i:j+1]
-                        parsed = json.loads(json_str)
-                        if isinstance(parsed, dict):
-                            t_name = parsed.get("name")
-                            t_args = parsed.get("arguments", parsed.get("args", parsed.get("parameters", parsed)))
-                            if isinstance(t_args, str):
-                                try:
-                                    t_args = json.loads(t_args)
-                                except Exception:
-                                    pass
-                            if not isinstance(t_args, dict):
-                                t_args = parsed
-                            
-                            if not t_name:
-                                sub_keys = ["sub_queries", "queries", "subqueries", "sub-queries", "questions", "sub_questions", "subquestions"]
-                                if any(k in t_args for k in sub_keys):
-                                    t_name = "decompose_query"
-                                elif "rewritten_query" in t_args or "query" in t_args:
-                                    t_name = "rewrite_query"
-                                elif "pseudo_document" in t_args or "expansion" in t_args:
-                                    t_name = "expand_query"
-                                else:
-                                    t_name = "keep_query_unchanged"
-                                    
-                            if t_name:
-                                tool_calls_list.append({"name": t_name, "args": t_args})
-                    except Exception:
-                        pass
-                    break
-                if char == '\\':
-                    escape = not escape
-                else:
-                    escape = False
-        i += 1
-    if tool_calls_list:
-        return tool_calls_list
-
-    # 4. Text question extraction fallback (e.g. "1. What is ... ? 2. What is ... ?")
-    numbered_questions = re.findall(r"(?:^|\n)\s*(?:\d+[\.\)]|\-|\*)\s*(.*?\?)", content_resp)
-    if len(numbered_questions) >= 2:
-        clean_qs = [clean_subquery_text(q) for q in numbered_questions if len(clean_subquery_text(q)) > 5]
-        if clean_qs:
-            tool_calls_list.append({
-                "name": "decompose_query",
-                "args": {
-                    "reflection": "Extracted sub-queries from model response text.",
-                    "reasoning": "Decomposed into numbered questions.",
-                    "sub_queries": clean_qs
-                }
-            })
-
-    return tool_calls_list
-
-
-def heuristic_least_to_most(query: str) -> Optional[List[str]]:
-    """
-    Applies deterministic Least-to-Most decomposition (Zhou et al., 2022)
-    when comparative or multi-entity queries are detected.
-    E.g. 'Were X and Y of the same nationality?' ->
-         ['What is the nationality of X?', 'What is the nationality of Y?']
+    Deterministic Least-to-Most decomposition (Zhou et al., 2022) for comparative multi-entity queries.
+    Returns (sub_queries_or_None, [entity1, entity2]).
     """
     clean_q = query.strip().rstrip("?").strip()
-    
-    # Pattern 1: "Were/Are X and Y (located) in/of the same [trait]?"
-    # Handles e.g. "Were Scott Derrickson and Ed Wood of the same nationality?"
-    # Handles e.g. "Are the Laleli Mosque and Esma Sultan Mansion located in the same neighborhood?"
-    pattern1 = r"^(?:Were|Are|Was|Is)\s+(?:the\s+)?(.+?)\s+and\s+(?:the\s+)?(.+?)\s+(?:located\s+in\s+the\s+same|in\s+the\s+same|of\s+the\s+same|born\s+in\s+the\s+same|share\s+the\s+same)\s+([a-zA-Z\s]+)$"
+
+    # Pattern 1: "Were/Are/Was/Is X and Y (located) in/of/born in/share the same [trait]?"
+    pattern1 = (
+        r"^(?:Were|Are|Was|Is)\s+(?:the\s+)?(.+?)\s+and\s+(?:the\s+)?(.+?)\s+"
+        r"(?:located\s+in\s+the\s+same|in\s+the\s+same|of\s+the\s+same|born\s+in\s+the\s+same|share\s+the\s+same)\s+([a-zA-Z\s]+)$"
+    )
     match1 = re.search(pattern1, clean_q, re.IGNORECASE)
     if match1:
         e1 = match1.group(1).strip()
         e2 = match1.group(2).strip()
         trait = match1.group(3).strip()
-        return [
-            f"What is the {trait} of {e1}?",
-            f"What is the {trait} of {e2}?"
-        ]
-        
-    # Pattern 2: "Are/Were X and Y both [trait]?"
-    # Handles e.g. "Are Local H and For Against both from the United States?"
-    pattern2 = r"^(?:Are|Were|Was|Is|Did)\s+(?:the\s+)?(.+?)\s+and\s+(?:the\s+)?(.+?)\s+both\s+([a-zA-Z\s]+)$"
+        return [f"What is the {trait} of {e1}?", f"What is the {trait} of {e2}?"], [e1, e2]
+
+    # Pattern 2: "Are/Were/Was/Is/Did X and Y both [predicate]?"
+    pattern2 = r"^(?:Are|Were|Was|Is|Did)\s+(?:the\s+)?(.+?)\s+and\s+(?:the\s+)?(.+?)\s+both\s+(.+)$"
     match2 = re.search(pattern2, clean_q, re.IGNORECASE)
     if match2:
         e1 = match2.group(1).strip()
@@ -249,31 +116,26 @@ def heuristic_least_to_most(query: str) -> Optional[List[str]]:
         trait = match2.group(3).strip()
         orig_starter = clean_q.split()[0].capitalize()
         if orig_starter in ["Are", "Were", "Was", "Is"]:
-            aux1 = "Is" if not (e1.endswith("s") or " and " in e1) else "Are"
-            aux2 = "Is" if not (e2.endswith("s") or " and " in e2) else "Are"
-            return [
-                f"{aux1} {e1} {trait}?",
-                f"{aux2} {e2} {trait}?"
-            ]
-        else:
-            return [
-                f"Did {e1} {trait}?",
-                f"Did {e2} {trait}?"
-            ]
+            return [f"Is {e1} {trait}?", f"Is {e2} {trait}?"], [e1, e2]
+        return [f"Did {e1} {trait}?", f"Did {e2} {trait}?"], [e1, e2]
 
-    # Pattern 3: "Who is older/younger, X or Y?"
-    # Handles e.g. "Who is older, Annie Morton or Terry Richardson?"
-    pattern3 = r"^Who is (?:older|younger|taller|larger|bigger),\s*(.+?)\s+or\s+(.+?)$"
+    # Pattern 3: "Who/Which is older/younger/taller/larger/bigger, X or Y?"
+    pattern3 = r"^(?:Who|Which\b[^,]*)\s+is\s+(older|younger|taller|shorter|larger|smaller|bigger),\s*(.+?)\s+or\s+(.+?)$"
     match3 = re.search(pattern3, clean_q, re.IGNORECASE)
     if match3:
-        e1 = match3.group(1).strip()
-        e2 = match3.group(2).strip()
-        return [
-            f"When was {e1} born?",
-            f"When was {e2} born?"
-        ]
+        adj = match3.group(1).lower()
+        e1 = match3.group(2).strip()
+        e2 = match3.group(3).strip()
+        if adj in ("older", "younger"):
+            return [f"When was {e1} born?", f"When was {e2} born?"], [e1, e2]
+        return [f"What is the {adj} attribute or size of {e1}?", f"What is the {adj} attribute or size of {e2}?"], [e1, e2]
 
-    return None
+    return None, []
+
+
+def heuristic_least_to_most(query: str) -> Optional[List[str]]:
+    subs, _ = heuristic_least_to_most_with_entities(query)
+    return subs
 
 
 # --- 2. NODO REFINER ---
@@ -281,64 +143,28 @@ def refiner_node(state: GraphState, llm) -> dict:
     num_ref = state.get("num_refinement", 0)
     print(f"\n--- [REFINER] Inizio Ottimizzazione Query (Ciclo {num_ref + 1}) ---")
     current_query_raw = state.get("current_query", state.get("original_query", ""))
-    
-    # Suddivisione in sub-query esistenti per consentire micro-raffinamento modulare
+
     queries = [q.strip() for q in current_query_raw.split("\n---\n") if q.strip()]
     if not queries:
         queries = [current_query_raw]
-        
-    tools = [decompose_query, expand_query, rewrite_query, keep_query_unchanged]
-    llm_with_tools = llm.bind_tools(tools)
-    
-    system_prompt = """You are the Autonomous Query Refinement Agent implementing SOTA query reformulation techniques:
+
+    system_prompt = """You are the Autonomous Query Refinement Agent implementing:
 - Least-to-Most Prompting (Zhou et al., 2022) via 'decompose_query'
 - Rewrite-Retrieve-Read (Ma et al., 2023) via 'rewrite_query'
 - Query2doc (Wang et al., 2023) via 'expand_query'
+- Direct passthrough via 'keep_query_unchanged'
 
-CORE OPERATIONAL RULES:
-1. PRESERVE ENTITIES: Never delete or generalize named entities from the original query (e.g. keep explicit names like "Marie Curie", never replace with generic terms).
-2. DECOMPOSITION: If the question asks to compare two entities, check a shared property, or involves multiple independent lookups, use 'decompose_query' to create clean sub-questions.
-3. ATOMIC QUESTIONS: If a query is already simple and focused on a single entity, call 'keep_query_unchanged'.
-4. NOISE REMOVAL: If conversational fluff is present, call 'rewrite_query'.
-5. REFLEXION: Use the 'reflection' parameter to critique and address the Validator's feedback.
+OPERATIONAL RULES:
+1. EXACT ENTITY PRESERVATION: Copy every proper noun, band name, person name, film/album title, and place name character-for-character from the input query. NEVER alter or substitute entity words!
+2. COMPARATIVE DECOMPOSITION: When the query compares two entities (e.g. "Were X and Y of the same...", "Are X and Y both...", "Who is older, X or Y?"), set tool_name='decompose_query' and output 2 self-contained atomic sub_queries, one per entity.
+3. ATOMIC QUERIES: When a query already focuses on a single entity or sequential bridge lookup, set tool_name='keep_query_unchanged' with sub_queries=[] and rewritten_text=''.
 
-FEW-SHOT EXAMPLES:
-Example 1 (Comparative query -> decompose_query):
-Query: "Were Marie Curie and Pierre Curie born in the same country?"
-Output:
-```json
-{
-  "name": "decompose_query",
-  "arguments": {
-    "reflection": "The question asks to compare two distinct people; looking up both simultaneously causes mixed search results.",
-    "reasoning": "Decomposing into two parallel atomic sub-queries for each person's birth country.",
-    "sub_queries": [
-      "What was the birth country of Marie Curie?",
-      "What was the birth country of Pierre Curie?"
-    ]
-  }
-}
-```
-
-Example 2 (Atomic factual query -> keep_query_unchanged):
-Query: "When was Albert Einstein born?"
-Output:
-```json
-{
-  "name": "keep_query_unchanged",
-  "arguments": {
-    "reflection": "The query is already a single atomic factual question ready for retrieval.",
-    "reasoning": "No decomposition or rewrite needed."
-  }
-}
-```
-
-CRITICAL INSTRUCTION: Output EXACTLY ONE RAW JSON tool call. Do not add conversational text."""
+Return a single JSON object conforming strictly to the RefinerDecision schema."""
 
     feedback_history = state.get("feedback_history", [])
     feedback_text = ""
     if feedback_history:
-        feedback_text = "\n\nFEEDBACK FROM VALIDATOR (You must explicitly address these critiques):\n- " + "\n- ".join(feedback_history)
+        feedback_text = "\n\nFEEDBACK FROM VALIDATOR:\n- " + "\n- ".join(feedback_history)
 
     final_processed_queries: List[str] = []
     tools_used_global: Set[str] = set()
@@ -348,118 +174,121 @@ CRITICAL INSTRUCTION: Output EXACTLY ONE RAW JSON tool call. Do not add conversa
         user_prompt = f"""Global Original Query: '{state.get('original_query', '')}'
 Current Sub-Query to refine: '{q}'{feedback_text}
 
-Analyze the query and feedback, then issue the appropriate JSON tool call."""
+Issue your RefinerDecision JSON."""
 
+        decision: Optional[RefinerDecision] = None
         content_resp = ""
         try:
-            response_msg = llm_with_tools.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_prompt)
-            ])
-            content_resp = getattr(response_msg, "content", str(response_msg))
-            tool_calls_list = extract_refiner_tool_calls(response_msg, content_resp)
+            decision, content_resp = invoke_structured_json(
+                llm,
+                RefinerDecision,
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt),
+                ],
+            )
         except Exception as e:
             print(f"[REFINER ERROR] Errore inferenza per la sub-query: {e}")
-            tool_calls_list = []
+            decision = None
 
-        # Heuristic Least-to-Most Fallback se nessun tool è stato estratto
-        if not tool_calls_list:
-            heuristic_subs = heuristic_least_to_most(q)
+        heuristic_subs, expected_entities = heuristic_least_to_most_with_entities(q)
+
+        # Fallback se il modello non ha restituito uno schema valido
+        if decision is None:
             if heuristic_subs:
-                print(f"   [REFINER] [Least-to-Most Fallback] Scomposizione euristica applicata per query comparativa.")
-                tool_calls_list = [{
-                    "name": "decompose_query",
-                    "args": {
-                        "reflection": "Heuristic Least-to-Most decomposition of composite comparative query.",
-                        "reasoning": "Splitting comparative query into independent sub-queries.",
-                        "sub_queries": heuristic_subs
-                    }
-                }]
-
-        if tool_calls_list:
-            # Considera la prima chiamata tool valida emessa per la sotto-query
-            first_tool = tool_calls_list[0]
-            t_name = first_tool.get("name")
-            if t_name not in ["decompose_query", "rewrite_query", "expand_query", "keep_query_unchanged"]:
-                t_name = "keep_query_unchanged"
-            tools_used_global.add(t_name)
-            args = first_tool.get("args", {})
-            print(f"   [REFINER REASONING]: {args.get('reasoning', 'No reasoning provided')}")
-            print(f"   [REFINER TOOL CALL]: '{t_name}'")
-
-            decomposed_queries = None
-            rewritten_query = None
-            expansion_text = None
-            keep_unchanged = False
-
-            is_comp = any(w in q.lower() for w in ["same", "both", "compare", "differ"]) or (" and " in q.lower())
-
-            if t_name == "decompose_query":
-                # La scomposizione è valida se la query corrente è composita o se è l'unica query globale
-                if is_comp or len(queries) == 1:
-                    sub_keys = ["sub_queries", "queries", "subqueries", "sub-queries", "questions", "sub_questions", "subquestions"]
-                    raw_subs = None
-                    for k in sub_keys:
-                        if k in args:
-                            raw_subs = args[k]
-                            break
-                    if isinstance(raw_subs, str):
-                        try:
-                            raw_subs = json.loads(raw_subs)
-                        except Exception:
-                            try:
-                                raw_subs = ast.literal_eval(raw_subs)
-                            except Exception:
-                                raw_subs = [raw_subs]
-                    if isinstance(raw_subs, list):
-                        decomposed_queries = [clean_subquery_text(s) for s in raw_subs if clean_subquery_text(s)]
-                        # Verifica che le sotto-query siano realmente atomiche e separate
-                        if is_comp and decomposed_queries:
-                            is_still_composite = any(
-                                any(w in sq.lower() for w in ["same", "both", "what about", "as well as", "either", "neither", "similar", "differ"])
-                                for sq in decomposed_queries
-                            ) or any(" and " in sq.lower() for sq in decomposed_queries)
-                            if is_still_composite:
-                                heuristic_subs = heuristic_least_to_most(q)
-                                if heuristic_subs:
-                                    print("   [REFINER] Rilevata scomposizione non atomica. Sostituzione con Least-to-Most rigorosa.")
-                                    decomposed_queries = heuristic_subs
-                else:
-                    # Se la sotto-query è già atomica, non riscomporla
-                    keep_unchanged = True
-            elif t_name == "rewrite_query":
-                rewritten_query = clean_subquery_text(args.get("rewritten_query", args.get("query", "")))
-            elif t_name == "expand_query":
-                expansion_text = args.get("pseudo_document", args.get("expansion", args.get("context")))
-            elif t_name == "keep_query_unchanged":
-                keep_unchanged = True
-
-            # Controllo rigoroso Least-to-Most (Zhou et al., 2022):
-            # Se la query è composita e il tool o il modello non hanno prodotto scomposizione valida,
-            # applica deterministicamente la scomposizione Least-to-Most
-            if is_comp and (keep_unchanged or not decomposed_queries):
-                heuristic_subs = heuristic_least_to_most(q)
-                if heuristic_subs:
-                    print("   [REFINER] Applicazione garantita di Least-to-Most per query comparativa.")
-                    decomposed_queries = heuristic_subs
-                    keep_unchanged = False
-
-            # Risoluzione delle modifiche
-            if decomposed_queries and isinstance(decomposed_queries, list):
-                final_processed_queries.extend(decomposed_queries)
-            elif rewritten_query and isinstance(rewritten_query, str):
-                final_processed_queries.append(rewritten_query.strip())
-            elif expansion_text and isinstance(expansion_text, str):
-                final_processed_queries.append(f"{q}\n[Expanded Context]: {expansion_text.strip()}")
-            elif keep_unchanged:
-                final_processed_queries.append(q)
+                print("   [REFINER] [Least-to-Most Fallback] Scomposizione deterministica applicata per query comparativa.")
+                decision = RefinerDecision(
+                    reflection="Comparative multi-entity query detected.",
+                    reasoning="Splitting comparative query into independent atomic sub-queries.",
+                    tool_name="decompose_query",
+                    sub_queries=heuristic_subs,
+                    rewritten_text="",
+                )
             else:
-                fallback_q = clean_subquery_text(args.get("query", args.get("rewritten_query", q)))
-                final_processed_queries.append(fallback_q if fallback_q else q)
+                decision = RefinerDecision(
+                    reflection="Query is atomic.",
+                    reasoning="Keeping atomic query unchanged.",
+                    tool_name="keep_query_unchanged",
+                    sub_queries=[],
+                    rewritten_text="",
+                )
+
+        t_name = decision.tool_name
+        print(f"   [REFINER REASONING]: {decision.reasoning}")
+        print(f"   [REFINER TOOL CALL]: '{t_name}'")
+
+        is_comp = heuristic_subs is not None or any(
+            w in q.lower() for w in ["same ", "both ", "compare ", "differ"]
+        )
+
+        if t_name == "decompose_query" and (is_comp or len(queries) == 1):
+            cleaned_subs = [clean_subquery_text(s) for s in decision.sub_queries if clean_subquery_text(s)]
+            joined_lower = " ".join(cleaned_subs).lower()
+
+            # Verifica che la scomposizione sia atomica e che NESSUNA entità nominata sia stata alterata/persa
+            still_composite = any(
+                any(w in sq.lower() for w in ["same ", "both ", "what about", "as well as", "either", "neither"])
+                for sq in cleaned_subs
+            ) or any(" and " in sq.lower() for sq in cleaned_subs)
+            missing_expected_entity = any(ent.lower() not in joined_lower for ent in expected_entities)
+
+            if (not cleaned_subs or len(cleaned_subs) < 2 or still_composite or missing_expected_entity) and heuristic_subs:
+                print("   [REFINER] Verifica preservazione entità Least-to-Most: ripristino sotto-query atomiche esatte.")
+                cleaned_subs = heuristic_subs
+
+            if cleaned_subs:
+                invoked_subs = decompose_query.invoke({
+                    "reflection": decision.reflection,
+                    "reasoning": decision.reasoning,
+                    "sub_queries": cleaned_subs,
+                })
+                tools_used_global.add("decompose_query")
+                final_processed_queries.extend(invoked_subs)
+            else:
+                keep_query_unchanged.invoke({"reflection": decision.reflection, "reasoning": decision.reasoning})
+                tools_used_global.add("keep_query_unchanged")
+                final_processed_queries.append(q)
+
+        elif is_comp and heuristic_subs:
+            # Garanzia Least-to-Most: se la query è comparativa ma il modello ha scelto keep_query_unchanged
+            print("   [REFINER] Applicazione garantita di Least-to-Most per query comparativa.")
+            invoked_subs = decompose_query.invoke({
+                "reflection": decision.reflection,
+                "reasoning": "Guaranteed Least-to-Most decomposition for comparative query.",
+                "sub_queries": heuristic_subs,
+            })
+            tools_used_global.add("decompose_query")
+            final_processed_queries.extend(invoked_subs)
+
+        elif t_name == "rewrite_query" and decision.rewritten_text.strip():
+            rw = clean_subquery_text(decision.rewritten_text)
+            # Impedisci che una riscrittura cancelli entità nominate tra virgolette o codici
+            quoted_orig = re.findall(r'["\']([^"\']+)["\']', q)
+            if any(qo.lower() not in rw.lower() for qo in quoted_orig):
+                rw = q
+            invoked_rw = rewrite_query.invoke({
+                "reflection": decision.reflection,
+                "reasoning": decision.reasoning,
+                "rewritten_query": rw,
+            })
+            tools_used_global.add("rewrite_query")
+            final_processed_queries.append(invoked_rw)
+
+        elif t_name == "expand_query" and decision.rewritten_text.strip():
+            invoked_exp = expand_query.invoke({
+                "reflection": decision.reflection,
+                "reasoning": decision.reasoning,
+                "pseudo_document": decision.rewritten_text.strip(),
+            })
+            tools_used_global.add("expand_query")
+            final_processed_queries.append(f"{q}\n[Expanded Context]: {invoked_exp}")
+
         else:
+            keep_query_unchanged.invoke({"reflection": decision.reflection, "reasoning": decision.reasoning})
+            tools_used_global.add("keep_query_unchanged")
             final_processed_queries.append(q)
 
-    # Deduplicazione ordinata delle sotto-query per prevenire query ridondanti o duplicate
+    # Deduplicazione ordinata delle sotto-query
     seen = set()
     deduped_queries = []
     for sq in final_processed_queries:
@@ -471,12 +300,12 @@ Analyze the query and feedback, then issue the appropriate JSON tool call."""
 
     final_query_str = "\n---\n".join(final_processed_queries)
     if tools_used_global:
-        print(f"[REFINER] Modifiche applicate con tool: {', '.join(tools_used_global).upper()}")
+        print(f"[REFINER] Modifiche applicate con tool: {', '.join(sorted(tools_used_global)).upper()}")
     else:
         print("[REFINER] Nessun tool chiamato, query mantenuta inalterata.")
     print(f"[REFINER] Output finale:\n{final_query_str}")
 
     return {
         "current_query": final_query_str,
-        "num_refinement": num_ref + 1
+        "num_refinement": num_ref + 1,
     }
