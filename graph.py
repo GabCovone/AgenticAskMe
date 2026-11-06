@@ -17,7 +17,8 @@ from state import GraphState
 # oppure Gemma-2-9B-it (come citato nel README per hardware con VRAM limitata).
 DEFAULT_REPO_ID = os.getenv("LLM_REPO_ID", "bartowski/Mistral-Nemo-Instruct-2407-GGUF")
 DEFAULT_FILENAME = os.getenv("LLM_FILENAME", "Mistral-Nemo-Instruct-2407-Q5_K_M.gguf")
-LOCAL_DIR = os.getenv("LLM_LOCAL_DIR", "./models")
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+LOCAL_DIR = os.getenv("LLM_LOCAL_DIR", os.path.join(REPO_ROOT, "models"))
 LOCAL_PATH = os.path.join(LOCAL_DIR, DEFAULT_FILENAME)
 
 # Temperatura impostata a 0.3 per favorire migliore flessibilità generativa e recupero da errori
@@ -79,6 +80,7 @@ def get_llama_model(model_path: Optional[str] = None, temperature: float = DEFAU
     """
     Inizializza e restituisce un'istanza singleton del modello LLM.
     Configurato con temperature=0.3 per bilanciare creatività nel refinement e precisione nel JSON parsing.
+    Verifica l'integrità del file GGUF prima del caricamento (riscarica se incompleto o corrotto).
     """
     global _cached_llm
     if _cached_llm is not None:
@@ -86,27 +88,71 @@ def get_llama_model(model_path: Optional[str] = None, temperature: float = DEFAU
         
     _preload_cuda_libraries()
 
-    target_path = model_path or LOCAL_PATH
+    # Cerca il file in percorsi noti e ne verifica l'integrità
+    candidate_paths = [
+        model_path,
+        LOCAL_PATH,
+        os.path.join(REPO_ROOT, "models", DEFAULT_FILENAME),
+        os.path.join(os.getcwd(), "models", DEFAULT_FILENAME),
+        os.path.join("/content", "models", DEFAULT_FILENAME),
+        os.path.join("/content", "AgenticAskMe", "models", DEFAULT_FILENAME),
+        f"./models/{DEFAULT_FILENAME}"
+    ]
     
-    # Se il file locale non esiste, scarica da Hugging Face Hub
-    if not os.path.exists(target_path):
+    valid_target_path = None
+    MIN_VALID_SIZE = 5 * 1024 * 1024 * 1024  # Almeno 5 GB per Mistral-Nemo-Q5 (pesa ~8.7 GB)
+
+    for p in candidate_paths:
+        if not p:
+            continue
+        abs_p = os.path.abspath(p)
+        if os.path.exists(abs_p):
+            fsize = os.path.getsize(abs_p)
+            if fsize >= MIN_VALID_SIZE:
+                valid_target_path = abs_p
+                break
+            else:
+                print(f"[INIT WARNING] File modello incompleto o corrotto rilevato in {abs_p} ({fsize / (1024**2):.1f} MB). Rimozione in corso...")
+                try:
+                    os.remove(abs_p)
+                except Exception:
+                    pass
+
+    if not valid_target_path:
         from huggingface_hub import hf_hub_download
-        print(f"[INIT] Download del modello GGUF ({DEFAULT_FILENAME}) da HuggingFace...")
+        print(f"[INIT] Download del modello GGUF ({DEFAULT_FILENAME}) da HuggingFace ({DEFAULT_REPO_ID})...")
         os.makedirs(LOCAL_DIR, exist_ok=True)
-        hf_hub_download(repo_id=DEFAULT_REPO_ID, filename=DEFAULT_FILENAME, local_dir=LOCAL_DIR)
-        
-    print(f"[INIT] Caricamento del modello GGUF in memoria (temperature={temperature})...")
+        downloaded = hf_hub_download(
+            repo_id=DEFAULT_REPO_ID,
+            filename=DEFAULT_FILENAME,
+            local_dir=LOCAL_DIR
+        )
+        valid_target_path = os.path.abspath(downloaded)
+
+    print(f"[INIT] Caricamento del modello GGUF in memoria da {valid_target_path} (temperature={temperature})...")
     try:
         from langchain_community.chat_models import ChatLlamaCpp
-        _cached_llm = ChatLlamaCpp(
-            model_path=target_path,
-            n_gpu_layers=-1,      # Offload completo su GPU (es. CUDA su Google Colab)
-            n_ctx=4096,           # Finestra di contesto ampia per RAG multi-hop
-            temperature=temperature,  # 0.3 per evitare collasso deterministico
-            max_tokens=2048,
-            repeat_penalty=1.15,
-            verbose=False
-        )
+        try:
+            _cached_llm = ChatLlamaCpp(
+                model_path=valid_target_path,
+                n_gpu_layers=-1,      # Offload completo su GPU (es. CUDA su Google Colab)
+                n_ctx=4096,           # Finestra di contesto ampia per RAG multi-hop
+                temperature=temperature,
+                max_tokens=2048,
+                repeat_penalty=1.15,
+                verbose=False
+            )
+        except Exception as e_gpu:
+            print(f"[INIT WARNING] Offload n_gpu_layers=-1 fallito ({e_gpu}). Tentativo con n_gpu_layers=33...")
+            _cached_llm = ChatLlamaCpp(
+                model_path=valid_target_path,
+                n_gpu_layers=33,      # Offload parziale sicuro per GPU con VRAM ridotta
+                n_ctx=4096,
+                temperature=temperature,
+                max_tokens=2048,
+                repeat_penalty=1.15,
+                verbose=False
+            )
         return _cached_llm
     except ImportError as e:
         print(f"[INIT WARNING] llama-cpp-python non disponibile nell'ambiente locale: {e}")
