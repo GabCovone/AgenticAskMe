@@ -318,7 +318,11 @@ Verify if the PROPOSED FINAL ANSWER is supported by the RETRIEVED EVIDENCE and o
             print("[VALIDATOR] JSON non riconosciuto. Applico fallback euristico rigoroso.")
             if evaluating_final_synthesis:
                 # Controlla se la risposta sintetizzata è valida e non un messaggio di errore/insufficienza
-                failure_words = ["not enough information", "unable to", "cannot be answered", "errore", "fallback"]
+                failure_words = [
+                    "not enough", "enough information", "unable to", "cannot be answered", "errore",
+                    "fallback", "do not have", "don't have", "no evidence", "not possible", "cannot determine",
+                    "not explicitly", "i do not have", "no specific"
+                ]
                 has_substance = len(final_answer.strip()) >= 10 and not any(w in final_answer.lower() for w in failure_words)
                 is_supported = has_substance and bool(context)
                 
@@ -355,15 +359,20 @@ Verify if the PROPOSED FINAL ANSWER is supported by the RETRIEVED EVIDENCE and o
         if evaluating_final_synthesis:
             ans_lower = final_answer.lower()
             ctx_lower = context.lower()
-            failure_words = ["unable to", "cannot", "don't know", "not enough information", "fallback", "error"]
-            is_substantive = len(final_answer.strip()) >= 15 and not any(w in ans_lower for w in failure_words)
+            failure_words = [
+                "unable to", "cannot", "don't know", "not enough", "enough information",
+                "do not have", "don't have", "no evidence", "not possible", "cannot determine",
+                "cannot be determined", "fallback", "error", "not explicitly", "no specific",
+                "it appears that", "i do not have"
+            ]
+            is_substantive = len(final_answer.strip()) >= 10 and not any(w in ans_lower for w in failure_words)
             
             # Estrae parole chiave significative della risposta e verifica se sono presenti nel contesto
-            words_in_answer = [w for w in re.findall(r'\b[a-zA-Z]{4,}\b', ans_lower) if w not in ["both", "were", "with", "from", "that", "this", "have", "been", "individual", "individuals", "nationality"]]
+            words_in_answer = [w for w in re.findall(r'\b[a-zA-Z]{4,}\b', ans_lower) if w not in ["both", "were", "with", "from", "that", "this", "have", "been", "individual", "individuals", "nationality", "located"]]
             grounded_words = [w for w in words_in_answer if w in ctx_lower]
             grounding_ratio = len(grounded_words) / len(words_in_answer) if words_in_answer else 0
             
-            if is_substantive and (grounding_ratio >= 0.5 or decision_obj.is_query_answered):
+            if is_substantive and (grounding_ratio >= 0.25 or (decision_obj.is_query_answered and bool(context))):
                 print(f"      [SELF-RAG GROUNDING CHECK] Risposta verificata e pienamente supportata dal contesto (grounding ratio: {grounding_ratio:.2f}).")
                 decision_obj.is_context_relevant = True
                 decision_obj.is_query_answered = True

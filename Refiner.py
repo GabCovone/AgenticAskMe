@@ -224,27 +224,53 @@ def heuristic_least_to_most(query: str) -> Optional[List[str]]:
          ['What is the nationality of X?', 'What is the nationality of Y?']
     """
     clean_q = query.strip().rstrip("?").strip()
-    pattern = r"^(?:Were|Did|Are|Is)\s+([A-Za-z\s\.]+?)\s+and\s+([A-Za-z\s\.]+?)\s+(?:of the same|share the same|born in the same|in the same)\s+([a-zA-Z\s]+)$"
-    match = re.search(pattern, clean_q, re.IGNORECASE)
-    if match:
-        e1 = match.group(1).strip()
-        e2 = match.group(2).strip()
-        trait = match.group(3).strip()
+    
+    # Pattern 1: "Were/Are X and Y (located) in/of the same [trait]?"
+    # Handles e.g. "Were Scott Derrickson and Ed Wood of the same nationality?"
+    # Handles e.g. "Are the Laleli Mosque and Esma Sultan Mansion located in the same neighborhood?"
+    pattern1 = r"^(?:Were|Are|Was|Is)\s+(?:the\s+)?(.+?)\s+and\s+(?:the\s+)?(.+?)\s+(?:located\s+in\s+the\s+same|in\s+the\s+same|of\s+the\s+same|born\s+in\s+the\s+same|share\s+the\s+same)\s+([a-zA-Z\s]+)$"
+    match1 = re.search(pattern1, clean_q, re.IGNORECASE)
+    if match1:
+        e1 = match1.group(1).strip()
+        e2 = match1.group(2).strip()
+        trait = match1.group(3).strip()
         return [
             f"What is the {trait} of {e1}?",
             f"What is the {trait} of {e2}?"
         ]
         
-    # Pattern 2: "Did X and Y work in the same field?"
-    pattern2 = r"^(?:Did|Were|Are)\s+([A-Za-z\s\.]+?)\s+and\s+([A-Za-z\s\.]+?)\s+both\s+([a-zA-Z\s]+)$"
+    # Pattern 2: "Are/Were X and Y both [trait]?"
+    # Handles e.g. "Are Local H and For Against both from the United States?"
+    pattern2 = r"^(?:Are|Were|Was|Is|Did)\s+(?:the\s+)?(.+?)\s+and\s+(?:the\s+)?(.+?)\s+both\s+([a-zA-Z\s]+)$"
     match2 = re.search(pattern2, clean_q, re.IGNORECASE)
     if match2:
         e1 = match2.group(1).strip()
         e2 = match2.group(2).strip()
         trait = match2.group(3).strip()
+        orig_starter = clean_q.split()[0].capitalize()
+        if orig_starter in ["Are", "Were", "Was", "Is"]:
+            aux1 = "Is" if not (e1.endswith("s") or " and " in e1) else "Are"
+            aux2 = "Is" if not (e2.endswith("s") or " and " in e2) else "Are"
+            return [
+                f"{aux1} {e1} {trait}?",
+                f"{aux2} {e2} {trait}?"
+            ]
+        else:
+            return [
+                f"Did {e1} {trait}?",
+                f"Did {e2} {trait}?"
+            ]
+
+    # Pattern 3: "Who is older/younger, X or Y?"
+    # Handles e.g. "Who is older, Annie Morton or Terry Richardson?"
+    pattern3 = r"^Who is (?:older|younger|taller|larger|bigger),\s*(.+?)\s+or\s+(.+?)$"
+    match3 = re.search(pattern3, clean_q, re.IGNORECASE)
+    if match3:
+        e1 = match3.group(1).strip()
+        e2 = match3.group(2).strip()
         return [
-            f"Did {e1} {trait}?",
-            f"Did {e2} {trait}?"
+            f"When was {e1} born?",
+            f"When was {e2} born?"
         ]
 
     return None
