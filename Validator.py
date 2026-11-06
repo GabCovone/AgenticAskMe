@@ -22,10 +22,10 @@ MAX_PLANNING = 4
 class ValidatorDecision(BaseModel):
     """Semantic validation, Self-RAG critique, and Adaptive-RAG routing decision."""
     reflection: str = Field(
-        description="REFLEXION: Verbal critique of past iterations. Identify missing entities, retrieval gaps, or potential hallucinations."
+        description="REFLEXION (concise, 1 sentence): Verbal critique of past iterations, missing entities, or hallucinations."
     )
     reasoning: str = Field(
-        description="CHAIN OF THOUGHT: Step-by-step logical justification for relevance, support, and routing."
+        description="CHAIN OF THOUGHT (concise, 1-2 sentences): Step-by-step justification for relevance, support, and routing."
     )
     query_complexity: Literal["simple", "complex", "already_decomposed"] = Field(
         description="ADAPTIVE-RAG: 'simple' for single-entity/bridge lookup, 'complex' for multi-entity comparison needing decomposition, 'already_decomposed' for atomic sub-queries."
@@ -277,10 +277,13 @@ Verify strict factual support and issue your ValidatorDecision JSON."""
                 "yes", "no", "the", "and", "both", "were", "was", "are", "is", "from", "with",
                 "that", "this", "have", "been", "same", "located", "born", "nationality", "older", "younger"
             }
+            orig_tokens = set(re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ0-9]{2,}", original_query.lower().replace(",", "")))
             ans_tokens = [
                 w for w in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ0-9]{2,}", ans_digits_norm)
                 if w not in stop_ans
             ]
+            novel_ans_tokens = [w for w in ans_tokens if w not in orig_tokens]
+            is_choice_q = " or " in original_query.lower()
             grounded_tokens = [w for w in ans_tokens if w in ctx_digits_norm]
             grounding_ratio = (len(grounded_tokens) / len(ans_tokens)) if ans_tokens else (1.0 if is_polar_ans and has_evidence else 0.0)
 
@@ -299,9 +302,17 @@ Verify strict factual support and issue your ValidatorDecision JSON."""
                 decision_obj.is_query_answered = False
                 decision_obj.feedback = f"Proposed answer '{ans_stripped}' is not grounded in retrieved text. Search for explicit supporting evidence."
                 act = "route_to_planning"
-            elif grounding_ratio >= 0.5 or (is_polar_ans and decision_obj.is_query_answered) or (ans_digits_norm in ctx_digits_norm):
+            elif not is_polar_ans and not is_choice_q and not novel_ans_tokens:
+                print("      [SELF-RAG GROUNDING CHECK] La risposta ripete solo parole della domanda senza aggiungere l'entità specifica. Reindirizzo al Planner.")
+                decision_obj.is_query_answered = False
+                decision_obj.feedback = f"Answer '{ans_stripped}' only repeats words already in the question. Perform Hop 2 search to find the specific missing entity/location."
+                act = "route_to_planning"
+            elif decision_obj.is_query_answered and (grounding_ratio >= 0.5 or is_polar_ans):
                 print(f"      [SELF-RAG GROUNDING CHECK] Risposta verificata e supportata dal contesto (grounding ratio: {grounding_ratio:.2f}).")
                 decision_obj.is_context_relevant = True
+                act = "finish"
+            elif not is_polar_ans and novel_ans_tokens and all(w in ctx_digits_norm for w in novel_ans_tokens) and decision_obj.is_context_relevant:
+                print(f"      [SELF-RAG GROUNDING CHECK] Risposta canonica verificata nel contesto (grounding ratio: {grounding_ratio:.2f}).")
                 decision_obj.is_query_answered = True
                 act = "finish"
 

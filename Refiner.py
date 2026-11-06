@@ -60,10 +60,10 @@ def keep_query_unchanged(reflection: str, reasoning: str) -> str:
 class RefinerDecision(BaseModel):
     """Structured query refinement decision selecting one of the four academic reformulation tools."""
     reflection: str = Field(
-        description="Critique of current query complexity and Validator feedback."
+        description="Concise 1-sentence critique of current query complexity and Validator feedback."
     )
     reasoning: str = Field(
-        description="Step-by-step justification for decomposing, rewriting, expanding, or keeping the query."
+        description="Concise 1-2 sentence justification for decomposing, rewriting, expanding, or keeping the query."
     )
     tool_name: Literal["decompose_query", "rewrite_query", "expand_query", "keep_query_unchanged"] = Field(
         description="Selected refinement tool."
@@ -227,7 +227,13 @@ Issue your RefinerDecision JSON."""
 
             # Verifica che la scomposizione sia atomica e che NESSUNA entità nominata sia stata alterata/persa
             still_composite = any(
-                any(w in sq.lower() for w in ["same ", "both ", "what about", "as well as", "either", "neither"])
+                any(
+                    w in sq.lower()
+                    for w in [
+                        "same ", "both ", "what about", "as well as", "either", "neither",
+                        "who is older", "who is younger", "who is taller", "which is older", "which is larger"
+                    ]
+                )
                 for sq in cleaned_subs
             ) or any(" and " in sq.lower() for sq in cleaned_subs)
             missing_expected_entity = any(ent.lower() not in joined_lower for ent in expected_entities)

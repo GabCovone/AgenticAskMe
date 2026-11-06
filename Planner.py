@@ -10,7 +10,7 @@ import warnings
 from typing import Dict, List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from state import GraphState, invoke_structured_json
 from local_kb import search_index
 
@@ -484,7 +484,7 @@ def web_search(query: str) -> str:
 class AdaptiveStrategy(BaseModel):
     """Adaptive-RAG classification of execution strategy and optimal retrieval source."""
     reasoning: str = Field(
-        description="Justification for strategy and knowledge source selection."
+        description="Concise 1-sentence justification for strategy and knowledge source selection."
     )
     strategy: Literal["internal_knowledge", "single_retrieval", "multi_step"] = Field(
         description="Execution strategy: 'single_retrieval' for atomic single-entity lookup, 'multi_step' for multi-hop/bridge questions."
@@ -500,20 +500,20 @@ class AdaptiveStrategy(BaseModel):
 class ReActStep(BaseModel):
     """Single structured step of the ReAct (Reasoning + Acting) investigative loop."""
     thought: str = Field(
-        description="Chain-of-thought analyzing prior observations, identifying any bridge entity discovered, and deciding the next search or final answer."
+        description="Concise 1-2 sentence chain-of-thought analyzing prior observations, identifying any bridge entity discovered, and deciding the next search or final answer."
     )
     action: Literal["local_kb_search", "web_search", "final_answer"] = Field(
-        description="Choose 'web_search' or 'local_kb_search' to retrieve missing facts, or 'final_answer' ONLY when the retrieved observations explicitly answer the sub-query."
+        description="Choose 'web_search' or 'local_kb_search' to retrieve missing facts, or 'final_answer' ONLY when the retrieved observations explicitly answer every hop of the sub-query."
     )
     action_input: str = Field(
-        description="If action is a search tool, provide the exact search query (targeting the bridge entity on Hop 2). If action is 'final_answer', state the concise factual finding."
+        description="If action is a search tool, provide the exact search query targeting the bridge entity discovered in the previous observation. If action is 'final_answer', state the concise factual finding."
     )
 
 
 class SynthesisOutput(BaseModel):
     """Structured Self-RAG grounded final synthesis."""
     reasoning: str = Field(
-        description="Step-by-step verification of the retrieved facts (e.g. comparing exact birth years where earlier year = older, comparing neighborhoods/nationalities, or citing the exact role/title/number)."
+        description="Concise 1-2 sentence verification of the exact retrieved facts for each entity/hop (e.g. comparing exact birth years where earlier year = older, comparing exact neighborhoods vs city, or citing the exact role/title/number)."
     )
     final_answer: str = Field(
         description="Concise canonical answer ONLY. For yes/no questions, start with 'yes' or 'no'. For Who/What/Where/Which/How many questions, output ONLY the exact entity name, title, role, location, or number (NEVER mention the unchosen candidate in 'X or Y' questions, and NEVER start with 'yes' or 'no')."
@@ -636,7 +636,7 @@ def planner_node(state: GraphState, llm) -> dict:
         )
 
     global_context = state.get("retrieved_context", "")
-    MAX_STEPS_PER_QUERY = 3
+    MAX_STEPS_PER_QUERY = 4
     intermediate_answers: List[str] = []
 
     seed_entities = [
@@ -695,12 +695,15 @@ Return your AdaptiveStrategy JSON."""
         except Exception as e:
             print(f"   [PLANNER WARNING] Fallback Adaptive-RAG: {e}")
 
-        # Qualsiasi domanda singola non decomposta può contenere un salto multi-hop (bridge):
-        # forziamo multi_step per permettere Hop 1 -> Hop 2 nel ciclo ReAct
-        if len(queries) == 1 and strategy != "multi_step":
+        # Regole strutturali Adaptive-RAG:
+        # - Domande già decomposte dal Refiner in sotto-query atomiche (len > 1) usano single_retrieval simmetrico e veloce.
+        # - Domande singole non decomposte (len == 1) usano multi_step per consentire il salto bridge Hop 1 -> Hop 2.
+        if len(queries) > 1 and num_plan == 0:
+            strategy = "single_retrieval"
+        elif len(queries) == 1 and strategy != "multi_step":
             strategy = "multi_step"
 
-        effective_hop0_query = preserve_hop0_anchors(query, search_term)
+        effective_hop0_query = query if num_plan == 0 else preserve_hop0_anchors(query, search_term)
         print(f"   [PLANNER] Strategia: {strategy.upper()} | Fonte: {retrieval_source.upper()} | Term: '{effective_hop0_query}'")
 
         try:
@@ -727,7 +730,8 @@ Return your AdaptiveStrategy JSON."""
                         if l.strip() and not l.strip().startswith(("---", "Title:", "Category:", "URL:"))
                     ]
                     if summary_lines:
-                        intermediate_answers.append(f"Sub-query: '{query}' -> Evidence: {summary_lines[0][:300]}")
+                        joined_sum = " ".join(summary_lines)[:450]
+                        intermediate_answers.append(f"Sub-query: '{query}' -> Evidence: {joined_sum}")
 
             else:
                 # 2. MULTI-STEP RETRIEVAL (Structured ReAct + IRCoT Loop)
@@ -786,9 +790,13 @@ Return a single JSON object conforming strictly to the ReActStep schema."""
                         intermediate_answers.append(f"Sub-query: '{query}' -> Finding: {ans_text}")
                         break
 
-                    # Determina la query di ricerca
+                    # Determina la query di ricerca:
+                    # - Al primo tentativo (Hop 0 del Ciclo 1), usa la query fedele per non perdere predicati o inserire rumore.
+                    # - Dai salti successivi (Hop 2+), usa la query bridge formulata dall'agente sull'entità scoperta nell'Observation!
                     raw_s_query = step_obj.action_input.strip() if isinstance(step_obj.action_input, str) else ""
-                    if attempt == 0:
+                    if attempt == 0 and num_plan == 0:
+                        s_query = effective_hop0_query
+                    elif attempt == 0:
                         s_query = preserve_hop0_anchors(query, raw_s_query or effective_hop0_query)
                     else:
                         s_query = raw_s_query if len(raw_s_query) >= 2 else effective_hop0_query
@@ -821,9 +829,12 @@ Return a single JSON object conforming strictly to the ReActStep schema."""
                         f"(such as a person, actress, director, band, or arena name) that requires a Hop {attempt+2} 'web_search' to find the final answer. "
                         f"Issue your next ReActStep JSON."
                     )
+                    # Registra prima la risposta assistant per rispettare rigorosamente l'alternanza user/assistant/user dei template Jinja (Mistral)
+                    assistant_json = raw_react.strip() if (raw_react and raw_react.strip()) else step_obj.model_dump_json()
+                    messages.append(AIMessage(content=assistant_json))
                     messages.append(HumanMessage(content=obs_prompt))
-                    if len(messages) > 6:
-                        messages = [messages[0], messages[1]] + messages[-3:]
+                    if len(messages) > 8:
+                        messages = [messages[0], messages[1]] + messages[-4:]
                 else:
                     # Se il loop ha eseguito tutti gli step di ricerca, chiedi una conclusione sintetica o registra evidenza
                     if step_context:
@@ -848,9 +859,11 @@ Return a single JSON object conforming strictly to the ReActStep schema."""
 
     if polar:
         answer_format_rule = (
-            "This is a YES/NO question. Compare the retrieved facts for both entities carefully in `reasoning`. "
-            "Then in `final_answer`, start with 'yes,' or 'no,' (lowercase) followed by a concise 1-sentence factual justification "
-            "(e.g. 'yes, both X and Y are American.' or 'no, X is in Laleli while Y is in Ortaköy.')."
+            "This is a YES/NO comparative question. In `reasoning`, explicitly state the exact requested attribute found for Entity 1 "
+            "and the exact requested attribute found for Entity 2 separately. "
+            "Pay strict attention to granularity: if the question asks about 'same neighborhood', sharing the same city (e.g. Istanbul) "
+            "does NOT mean same neighborhood (e.g. Laleli vs Ortaköy -> answer 'no')! "
+            "Then in `final_answer`, start with 'yes,' or 'no,' (lowercase) followed by a concise 1-sentence factual justification."
         )
     else:
         answer_format_rule = (
