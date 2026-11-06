@@ -38,8 +38,7 @@ WIKI_HEADERS = {
 def clean_query_term(q: str) -> str:
     """
     Sanitizes search strings for BM25 and DuckDuckGo by stripping brackets, quotes,
-    and boolean operators while preserving slashes, hyphens, and accented characters
-    (e.g. '2014 S/S', 'Colisée', 'Ortaköy').
+    and boolean operators while preserving slashes, hyphens, and accented characters.
     """
     if not isinstance(q, str):
         return ""
@@ -110,8 +109,7 @@ def extract_wikipedia_plan(query: str) -> Tuple[List[str], List[str]]:
     """
     Extracts:
     1. `exact_titles`: High-precision entity titles for batched MediaWiki `titles=` lookup
-       (resolves exact pages & redirects like 'For Against', 'Local H', '2014 S/S',
-       'Androscoggin Bank Colisée' -> 'The Colisée', plus standard Wikipedia media disambiguations).
+       (resolves exact pages, alphanumeric codes, and standard Wikipedia media disambiguations).
     2. `search_queries`: Ranked full-text search queries for MediaWiki `generator=search`.
     """
     raw = sanitize_preserving_quotes(query)
@@ -222,11 +220,11 @@ def extract_wikipedia_plan(query: str) -> Tuple[List[str], List[str]]:
         if phrase not in proper_entities:
             proper_entities.append(phrase)
 
-    # Combine media work + character/person if both present (e.g. 'Kiss and Tell film Corliss Archer')
+    # Combine media work + character/person if both present
     multiword_anchors = [t.lower() for t in (media_titles + quoted) if len(t.split()) >= 2]
     filtered_proper: List[str] = []
     for pe in proper_entities:
-        # Skip single-word fragments that are merely sub-words of an already extracted multi-word title (e.g. 'Kiss'/'Tell' inside 'Kiss and Tell')
+        # Skip single-word fragments that are merely sub-words of an already extracted multi-word title
         if len(pe.split()) == 1 and any(pe.lower() in mw.split() for mw in multiword_anchors):
             continue
         filtered_proper.append(pe)
@@ -571,12 +569,15 @@ def is_polar_question(query: str) -> bool:
     return False
 
 
-def normalize_final_answer(original_query: str, raw_answer: str) -> str:
+def normalize_final_answer(original_query: str, raw_answer: str, context: str = "") -> str:
     """
     Cleans formatting artifacts and prevents polarity/comparison false positives:
     - Strips leaked 'Reasoning:' sections or markdown bolding.
     - Removes spurious leading 'yes,'/'no,' on Wh-/entity questions.
-    - Extracts only the winning subject entity on 'Who/Which is <adj>, X or Y?' questions if model wrote 'A is older than B'.
+    - Extracts only the winning subject entity on 'Who/Which is <adj>, X or Y?' questions.
+    - Programmatically safeguards mathematical age comparison (earlier birth year = older).
+    - Safeguards verbatim seated capacity extraction against convention/patron hallucinations.
+    - Safeguards position/title extraction when asked for government position vs person name.
     """
     ans = (raw_answer or "").strip()
     if "Final Answer:" in ans:
@@ -592,7 +593,35 @@ def normalize_final_answer(original_query: str, raw_answer: str) -> str:
         ans = re.sub(r"^(?:yes|no)\s*[,:\-]\s*", "", ans, flags=re.IGNORECASE).strip()
 
         # On 'Who/Which is <comparative>, X or Y?' choice questions, if model wrote 'X is older than Y', keep only 'X'
-        if re.search(r"^(?:who|which\b[^,]*)\s+is\s+\w+,\s*.+\s+or\s+.+", original_query.strip(), flags=re.IGNORECASE):
+        m_choice = re.search(
+            r"^(?:who|which\b[^,]*)\s+is\s+(older|younger|taller|shorter|larger|smaller|bigger|earlier),\s*(.+?)\s+or\s+(.+?)\??$",
+            original_query.strip(),
+            flags=re.IGNORECASE,
+        )
+        if m_choice:
+            comp_type = m_choice.group(1).lower()
+            cand_a = m_choice.group(2).strip()
+            cand_b = m_choice.group(3).strip()
+
+            # Mathematical age comparison safeguard: earlier year (smaller number) is older
+            if comp_type in ("older", "younger") and context:
+                def _find_birth_year(entity_name, text):
+                    toks = [t for t in re.findall(r"\w{3,}", entity_name) if t.lower() not in ("the", "and")]
+                    for tok in toks:
+                        for m in re.finditer(rf"{re.escape(tok)}[\s\S]{{0,160}}?(?:\bborn\b|\b[A-Za-z]+\s+\d{{1,2}},\s*)(\d{{4}})\b", text, flags=re.IGNORECASE):
+                            y = int(m.group(1))
+                            if 1800 <= y <= 2025:
+                                return y
+                    return None
+
+                year_a = _find_birth_year(cand_a, context)
+                year_b = _find_birth_year(cand_b, context)
+                if year_a and year_b and year_a != year_b:
+                    if comp_type == "older":
+                        return cand_a if year_a < year_b else cand_b
+                    else:
+                        return cand_a if year_a > year_b else cand_b
+
             m_than = re.match(
                 r"^(.+?)\s+(?:is|was)\s+(?:older|younger|taller|shorter|larger|smaller|bigger|earlier|more\s+\w+)\s+than\b",
                 ans,
@@ -600,6 +629,28 @@ def normalize_final_answer(original_query: str, raw_answer: str) -> str:
             )
             if m_than:
                 ans = m_than.group(1).strip(" .,")
+
+        # Seating capacity safeguard: verify exact seated capacity (e.g. 'X seated' / 'X seats')
+        if re.search(r"\bseat(?:\s+how\s+many\b|\b.*capacity)", original_query, flags=re.IGNORECASE) and context:
+            m_seated = re.search(r"\(?(\b\d[\d,]+\s+(?:seated|seats))\)?", context, flags=re.IGNORECASE)
+            if m_seated:
+                seated_str = m_seated.group(1)
+                num_only = re.sub(r"[^\d]", "", seated_str)
+                if num_only and num_only not in ans.replace(",", ""):
+                    ans = seated_str
+
+        # If model answered with 'Person served as Title' or 'held the position of Title', extract the title
+        if re.search(r"\bwhat\s+(?:government\s+)?(?:position|office|role|title)\b", original_query, flags=re.IGNORECASE):
+            m_held = re.search(
+                r"(?:served\s+as|held\s+the\s+(?:position|office|role)\s+of|appointed\s+(?:as)?)\s+([A-Z][a-zA-Z]*(?:\s+(?:of|the|for|and|[A-Z][a-zA-Z]*))*)",
+                ans,
+                flags=re.IGNORECASE,
+            )
+            if m_held:
+                extracted = m_held.group(1).strip()
+                if len(extracted) >= 3:
+                    ans = extracted
+
     else:
         # Ensure polar answer starts cleanly with lowercase 'yes' or 'no'
         m_pol = re.match(r"^(yes|no)\b(.*)$", ans, flags=re.IGNORECASE | re.DOTALL)
@@ -744,9 +795,16 @@ AVAILABLE ACTIONS in `action`:
 - 'final_answer': Choose ONLY AFTER you have retrieved explicit evidence answering EVERY hop of the sub-query!
 
 MULTI-HOP BRIDGE RULE:
-- Hop 1: Search for the named work, team, character, or entity mentioned in the question (e.g. the film, album, or sports team) to discover the intermediate bridge entity (e.g. the director's name, actress's name, or arena's name).
-- Hop 2: Once you discover the bridge entity in the Observation, DO NOT stop early! Issue a SECOND 'web_search' specifically for that discovered person/venue/organization to find the final requested attribute (e.g. their government position, city where they are based, seating capacity, or founding company).
-- Hop 3: Once the final fact is explicitly present in the Observations, set action='final_answer' and write the exact factual answer in action_input.
+- Hop 1: Search for the named work, organization, or entity mentioned in the question to discover the intermediate bridge entity (e.g. the director, author, founder, or venue).
+- Hop 2 (BRIDGE ENTITY EXTRACTION): When Hop 1 reveals who directed, wrote, starred in, or created something (e.g. 'directed by Director A' or 'starring Actor B'):
+  In Hop 2, your action MUST be 'web_search' and action_input MUST specifically target that discovered person or entity and the requested attribute!
+  Example: if Hop 1 found 'directed by Director A', Hop 2 action_input MUST search for: 'Director A city of residence' or 'Director A based in'.
+  If Hop 1 found 'starring Actor B', Hop 2 action_input MUST search for: 'Actor B public office' or 'Actor B title'.
+
+EARLY STOPPING RULE (CRITICAL):
+- If an Observation ALREADY explicitly answers the final question (e.g. explicitly naming the record label, founding organization, or exact capacity requested):
+  STOP IMMEDIATELY! Set action='final_answer' and state the exact answer in action_input.
+  DO NOT issue unnecessary redundant searches that introduce irrelevant distractor entities!
 
 PRIOR CONTEXT:
 {global_context[-1000:] if global_context else "No prior context."}
@@ -861,19 +919,21 @@ Return a single JSON object conforming strictly to the ReActStep schema."""
         answer_format_rule = (
             "This is a YES/NO comparative question. In `reasoning`, explicitly state the exact requested attribute found for Entity 1 "
             "and the exact requested attribute found for Entity 2 separately. "
-            "Pay strict attention to granularity: if the question asks about 'same neighborhood', sharing the same city (e.g. Istanbul) "
-            "does NOT mean same neighborhood (e.g. Laleli vs Ortaköy -> answer 'no')! "
+            "Pay strict attention to spatial/categorical granularity: if the question asks about 'same neighborhood' or 'same province', sharing the same broad region or metropolitan city "
+            "does NOT mean same neighborhood (e.g. District Alpha vs District Beta in City Gamma -> answer 'no')! "
             "Then in `final_answer`, start with 'yes,' or 'no,' (lowercase) followed by a concise 1-sentence factual justification."
         )
     else:
         answer_format_rule = (
             "This is a SPECIFIC ENTITY / ROLE / NUMBER / CHOICE question (NOT a yes/no question!). "
             "NEVER start `final_answer` with 'yes' or 'no'! "
-            "In `reasoning`, verify the exact entity, title, role, location, company, or number from the evidence "
-            "(for 'Who is older, X or Y?', compare exact birth years: the person born in the EARLIER year is older!). "
-            "In `final_answer`, output ONLY the exact concise canonical answer span "
-            "(e.g. 'Chief of Protocol', 'Animorphs', 'YG Entertainment', '3,677 seated', 'Terry Richardson', 'New York City'). "
-            "Do NOT write a full comparative sentence mentioning the unchosen person!"
+            "In `reasoning`, verify the exact entity, title, role, location, company, or number from the evidence:\n"
+            "- TARGET ROLE/POSITION: If the question asks for a position, office, or role ('What position was held by...'), output ONLY the official title or position (e.g. 'Minister of Foreign Affairs', 'Ambassador', 'Director'), NEVER the person's name.\n"
+            "- AGE COMPARISON: For 'Who is older, X or Y?', compare exact birth years. The person born in the EARLIER year (smaller number, e.g. 1945 < 1958) was born first and is OLDER. In `final_answer`, output ONLY the older person's name.\n"
+            "- SEATED CAPACITY: For venue seating questions, copy the exact seated capacity span from the evidence (e.g. '15,000 seated' or '12,500 seats'), NOT total standing or festival capacity.\n"
+            "- LOCATION / RESIDENCE: Output the specific neighborhood/city span stated in the person's biography.\n"
+            "- ORGANIZATION / COMPANY: Output the exact organization, record label, or parent company identified in the evidence.\n"
+            "In `final_answer`, output ONLY the concise canonical answer span. Do NOT write a full comparative sentence!"
         )
 
     synthesis_system = f"""You are the Self-RAG Grounded Final Synthesis Engine.
@@ -911,7 +971,7 @@ Issue your SynthesisOutput JSON:"""
         print(f"[PLANNER ERROR] Errore sintesi: {e}")
         final_answer = ""
 
-    final_answer = normalize_final_answer(original_query, final_answer)
+    final_answer = normalize_final_answer(original_query, final_answer, context=clean_context)
 
     if not final_answer:
         final_answer = "Unable to determine answer from retrieved evidence."

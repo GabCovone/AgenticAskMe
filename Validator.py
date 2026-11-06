@@ -34,7 +34,7 @@ class ValidatorDecision(BaseModel):
         description="SELF-RAG (IsRel): True if retrieved context contains factual evidence about the target entities."
     )
     is_query_answered: bool = Field(
-        description="SELF-RAG (IsSup): True ONLY if the proposed answer is factually supported by the retrieved context without hallucination."
+        description="SELF-RAG (IsSup): True if the proposed answer directly resolves the question and is factually supported by retrieved evidence. For Yes/No questions, 'no' is True when evidence confirms the entities differ in the requested property. False if unsupported, circular, or wrong entity type."
     )
     feedback: str = Field(
         description="Actionable instructions for the next node (e.g. which entity or fact is still missing)."
@@ -145,12 +145,13 @@ Evaluate whether the PROPOSED FINAL ANSWER is strictly supported by the RETRIEVE
 EVALUATION RULES:
 1. is_context_relevant (IsRel): True if the retrieved evidence contains factual information about the entities in the question.
 2. is_query_answered (IsSup):
-   - True ONLY if the Proposed Final Answer directly answers the question AND every factual claim in it is supported by the Retrieved Evidence.
+   - True if the Proposed Final Answer directly answers the question AND every factual claim in it is supported by the Retrieved Evidence.
+   - For polar questions (Yes/No): A negative answer starting with 'no' IS FULLY VALID and SUPPORTED (is_query_answered = True) when the evidence shows the two entities differ in the requested property (e.g. different neighborhoods: District Alpha vs District Beta).
    - For comparative questions involving two entities, BOTH entities must have supporting facts in the Retrieved Evidence.
-   - False if the answer hallucinates dates/facts not in the evidence, echoes the question without answering it, or says information is unavailable.
+   - False if the answer answers with the wrong type of entity (e.g. returns a person's name when asked for a government position or title), repeats the question circularly, or hallucinates facts not in the evidence.
 3. next_action:
    - 'finish' when is_query_answered is True.
-   - 'route_to_planning' when critical evidence is missing or the answer is unsupported.
+   - 'route_to_planning' when critical evidence is missing, the answer is the wrong entity type, or unsupported.
 
 Return a single JSON object conforming strictly to the ValidatorDecision schema."""
     else:
@@ -253,7 +254,7 @@ Verify strict factual support and issue your ValidatorDecision JSON."""
                 "cannot be determined", "fallback", "errore durante", "not explicitly", "no specific",
                 "i do not have", "unknown"
             ]
-            # Concise entity/number/polar answers (e.g. 'yes', 'no', 'Animorphs', '3,677 seated') are valid (>=2 chars),
+            # Concise entity/number/polar answers (e.g. 'yes', 'no', 'Novel Series', '15,000 seated') are valid (>=2 chars),
             # whereas echoed questions ending in '?' or failure phrases are rejected.
             is_echoed_question = ans_stripped.endswith("?")
             is_substantive = (
@@ -287,6 +288,16 @@ Verify strict factual support and issue your ValidatorDecision JSON."""
             grounded_tokens = [w for w in ans_tokens if w in ctx_digits_norm]
             grounding_ratio = (len(grounded_tokens) / len(ans_tokens)) if ans_tokens else (1.0 if is_polar_ans and has_evidence else 0.0)
 
+            # Rilevamento risposte circolari che ripetono il nome d'arte della domanda (es. 'Aladdin' per stage name 'Aladin')
+            is_echoed_stage_name = False
+            m_stage = re.search(r"\bstage name\s+([A-Za-z0-9]+)\b", original_query, flags=re.IGNORECASE)
+            if m_stage:
+                st_name = m_stage.group(1).lower()
+                ans_core = re.sub(r"[^\w]", "", ans_lower)
+                st_core = re.sub(r"[^\w]", "", st_name)
+                if ans_core.startswith(st_core[:4]) and len(ans_core) <= len(st_core) + 2:
+                    is_echoed_stage_name = True
+
             if not is_substantive or not has_evidence:
                 print("      [SELF-RAG GROUNDING CHECK] Risposta elusiva, interrogativa o priva di evidenze. Reindirizzo al Planner.")
                 decision_obj.is_query_answered = False
@@ -296,6 +307,11 @@ Verify strict factual support and issue your ValidatorDecision JSON."""
                 print(f"      [SELF-RAG GROUNDING CHECK] Evidenze mancanti per entità comparate: {missing_ents}. Reindirizzo al Planner.")
                 decision_obj.is_query_answered = False
                 decision_obj.feedback = f"Missing retrieved evidence for: {', '.join(missing_ents)}. Search explicitly for {', '.join(missing_ents)}."
+                act = "route_to_planning"
+            elif is_echoed_stage_name:
+                print(f"      [SELF-RAG GROUNDING CHECK] La risposta '{ans_stripped}' ripete solo il nome d'arte invece dell'identità reale. Reindirizzo al Planner.")
+                decision_obj.is_query_answered = False
+                decision_obj.feedback = f"Answer '{ans_stripped}' merely repeats the stage name. Search for the real identity and name of the person."
                 act = "route_to_planning"
             elif not is_polar_ans and ans_tokens and grounding_ratio == 0.0:
                 print("      [SELF-RAG GROUNDING CHECK] Nessun token della risposta trovato nel contesto recuperato (possibile allucinazione). Reindirizzo al Planner.")
@@ -307,11 +323,16 @@ Verify strict factual support and issue your ValidatorDecision JSON."""
                 decision_obj.is_query_answered = False
                 decision_obj.feedback = f"Answer '{ans_stripped}' only repeats words already in the question. Perform Hop 2 search to find the specific missing entity/location."
                 act = "route_to_planning"
-            elif decision_obj.is_query_answered and (grounding_ratio >= 0.5 or is_polar_ans):
+            elif is_polar_ans and not missing_ents and has_evidence and (decision_obj.next_action == "finish" or decision_obj.is_query_answered):
+                print(f"      [SELF-RAG GROUNDING CHECK] Risposta polare verificata con evidenze presenti per entrambe le entità.")
+                decision_obj.is_query_answered = True
+                decision_obj.is_context_relevant = True
+                act = "finish"
+            elif decision_obj.is_query_answered and (grounding_ratio >= 0.5 or is_polar_ans) and decision_obj.next_action == "finish":
                 print(f"      [SELF-RAG GROUNDING CHECK] Risposta verificata e supportata dal contesto (grounding ratio: {grounding_ratio:.2f}).")
                 decision_obj.is_context_relevant = True
                 act = "finish"
-            elif not is_polar_ans and novel_ans_tokens and all(w in ctx_digits_norm for w in novel_ans_tokens) and decision_obj.is_context_relevant:
+            elif not is_polar_ans and novel_ans_tokens and all(w in ctx_digits_norm for w in novel_ans_tokens) and decision_obj.is_context_relevant and decision_obj.next_action == "finish":
                 print(f"      [SELF-RAG GROUNDING CHECK] Risposta canonica verificata nel contesto (grounding ratio: {grounding_ratio:.2f}).")
                 decision_obj.is_query_answered = True
                 act = "finish"
