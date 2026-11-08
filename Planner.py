@@ -12,7 +12,31 @@ from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from state import GraphState, invoke_structured_json
+import os
 from local_kb import search_index
+
+# Modalità di retrieval globale configurabile a runtime:
+# - 'full' (default): Sistema Integrale (Adaptive-RAG con KB locale + Ricerca Web Live).
+# - 'baseline': Sistema Baseline (Accesso consentito ESCLUSIVAMENTE alla KB Locale di Wikipedia).
+RETRIEVAL_MODE: str = os.environ.get("AGENTIC_IR_MODE", "full").lower()
+
+
+def set_retrieval_mode(mode: str) -> None:
+    """
+    Imposta a runtime la modalità di retrieval del sistema senza modificare alcun prompt:
+    - 'full': abilita il sistema completo con Adaptive-RAG, KB locale e Web Search.
+    - 'baseline': vincola rigidamente il sistema alla sola Knowledge Base locale di Wikipedia.
+    """
+    global RETRIEVAL_MODE
+    if str(mode).lower() in ("baseline", "local", "local_only", "kb_only"):
+        RETRIEVAL_MODE = "baseline"
+    else:
+        RETRIEVAL_MODE = "full"
+
+
+def get_retrieval_mode() -> str:
+    """Restituisce la modalità di retrieval attualmente attiva ('full' oppure 'baseline')."""
+    return RETRIEVAL_MODE
 
 warnings.filterwarnings("ignore")
 logging.captureWarnings(True)
@@ -433,6 +457,10 @@ def web_search(query: str) -> str:
     Preserves quotes and exact entity titles, falling back to or enriching with live Web snippets
     when Wikipedia has no match or only a short stub lead (<350 chars).
     """
+    if RETRIEVAL_MODE == "baseline":
+        print("      [BASELINE MODE ACTIVE] Ricerca Web esterna disabilitata: reindirizzamento forzato alla KB locale.")
+        return local_kb_search.invoke({"query": query})
+
     raw_q = sanitize_preserving_quotes(query)
     cleaned_q = clean_query_term(query)
     if not cleaned_q or len(cleaned_q) < 2:
@@ -755,20 +783,27 @@ Return your AdaptiveStrategy JSON."""
             strategy = "multi_step"
 
         effective_hop0_query = query if num_plan == 0 else preserve_hop0_anchors(query, search_term)
-        print(f"   [PLANNER] Strategia: {strategy.upper()} | Fonte: {retrieval_source.upper()} | Term: '{effective_hop0_query}'")
+        current_mode = state.get("retrieval_mode", RETRIEVAL_MODE).lower()
+        effective_mode = "baseline" if current_mode in ("baseline", "local", "local_only", "kb_only") else "full"
+        source_display = "LOCAL_KB (BASELINE)" if effective_mode == "baseline" else retrieval_source.upper()
+        print(f"   [PLANNER] Modalità: {effective_mode.upper()} | Strategia: {strategy.upper()} | Fonte: {source_display} | Term: '{effective_hop0_query}'")
 
         try:
             if strategy == "single_retrieval":
-                print(f"   [PLANNER] Esecuzione single_retrieval [{retrieval_source.upper()}] per -> '{effective_hop0_query}'")
+                print(f"   [PLANNER] Esecuzione single_retrieval [{source_display}] per -> '{effective_hop0_query}'")
                 tool_result = ""
-                if retrieval_source in ("local_kb", "both"):
+                if effective_mode == "baseline":
+                    print("      [BASELINE ACTIVE] Retrieval vincolato esclusivamente alla Knowledge Base locale.")
                     tool_result = local_kb_search.invoke({"query": effective_hop0_query})
-                if retrieval_source in ("web", "both") or "Nessun risultato rilevante" in tool_result:
-                    if tool_result and "Nessun risultato rilevante" in tool_result:
-                        print("      [PLANNER] Nessun match locale. Fallback automatico su Web Search...")
-                        tool_result = ""
-                    web_res = web_search.invoke({"query": effective_hop0_query})
-                    tool_result = f"{tool_result}\n{web_res}".strip() if tool_result else web_res
+                else:
+                    if retrieval_source in ("local_kb", "both"):
+                        tool_result = local_kb_search.invoke({"query": effective_hop0_query})
+                    if retrieval_source in ("web", "both") or "Nessun risultato rilevante" in tool_result:
+                        if tool_result and "Nessun risultato rilevante" in tool_result:
+                            print("      [PLANNER] Nessun match locale. Fallback automatico su Web Search...")
+                            tool_result = ""
+                        web_res = web_search.invoke({"query": effective_hop0_query})
+                        tool_result = f"{tool_result}\n{web_res}".strip() if tool_result else web_res
 
                 tool_result = tool_result[:2400]
                 preview = tool_result[:160].replace("\n", " ") + "..."
@@ -865,7 +900,10 @@ Return a single JSON object conforming strictly to the ReActStep schema."""
                         break
                     executed_queries.append(s_query)
 
-                    if step_obj.action == "local_kb_search" and has_seed:
+                    if effective_mode == "baseline":
+                        print(f"      [ReAct Action (Baseline Mode)]: local_kb_search vincolato -> '{s_query}'")
+                        t_res = local_kb_search.invoke({"query": s_query})
+                    elif step_obj.action == "local_kb_search" and has_seed:
                         print(f"      [ReAct Action]: local_kb_search -> '{s_query}'")
                         t_res = local_kb_search.invoke({"query": s_query})
                         if "Nessun risultato rilevante" in t_res:

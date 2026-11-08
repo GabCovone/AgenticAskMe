@@ -8,6 +8,7 @@ from typing import List, Dict
 
 import local_kb
 import history_db
+import Planner
 
 # Page configuration
 st.set_page_config(
@@ -41,10 +42,22 @@ temperature = st.sidebar.slider(
 )
 st.sidebar.caption("💡 *Impostato a 0.3 per evitare risposte rigide e stimolare una migliore riformulazione delle query.*")
 
-retrieval_mode = st.sidebar.selectbox(
-    "Modalità di Ricerca Default",
-    ["Adaptive (Scelta Automatica)", "Local Wikipedia Knowledge Base", "Live Web Search (DuckDuckGo)", "Hybrid (Entrambe)"]
+system_choice = st.sidebar.radio(
+    "Modalità Sistema IR",
+    [
+        "🌟 Sistema Integrale (KB Locale + Web Live)",
+        "🏛️ Sistema Baseline (Solo KB Locale)"
+    ],
+    index=0,
+    help="Scegli se consentire al sistema di interrogare anche il Web esterno o se vincolarlo rigidamente alla sola Knowledge Base locale di Wikipedia."
 )
+is_baseline = "Baseline" in system_choice
+Planner.set_retrieval_mode("baseline" if is_baseline else "full")
+
+if is_baseline:
+    st.sidebar.warning("⚠️ **Modalità Baseline Attiva**: L'agente cercherà ESCLUSIVAMENTE all'interno dei 29 articoli della KB locale di Wikipedia. L'accesso al Web è disabilitato.")
+else:
+    st.sidebar.success("✅ **Sistema Integrale Attivo**: L'agente effettua retrieval adattivo tra KB locale e Web Search live.")
 
 st.sidebar.divider()
 st.sidebar.subheader("📚 Local Wikipedia KB")
@@ -131,10 +144,11 @@ with tab_exec:
                 steps_trace.append({"step": 1, "node": "Validator", "action": decision.upper(), "complexity": complexity})
                 reasoning_trace.append(f"[Validator Node] Analisi complessità query: '{user_query}' classificata come {complexity.upper()}. Instradamento: {decision.upper()}.")
                 
-                c1, c2, c3 = st.columns(3)
+                c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Complessità Rilevata", complexity.upper())
                 c2.metric("Azione Consigliata", decision.upper())
                 c3.metric("Temperatura", temperature)
+                c4.metric("Modalità Retrieval", "BASELINE (Solo KB)" if is_baseline else "INTEGRALE (Web+KB)")
                 
             progress_bar.progress(35, text="Esecuzione del modulo designato...")
 
@@ -260,7 +274,7 @@ with tab_history:
     all_runs = history_db.get_all_runs()
     if not all_runs:
         st.warning("Nessuna esecuzione registrata nel database.")
-        if st.button("🌱 Inizializza con i 10 Test del Benchmark HotpotQA"):
+        if st.button("🌱 Inizializza con il Benchmark HotpotQA (30 Test)"):
             history_db.seed_benchmark_runs(force_reseed=True)
             st.rerun()
     else:
@@ -305,7 +319,7 @@ with tab_history:
                 mime="text/csv"
             )
         with col_reseed:
-            if st.button("🔄 Ripristina Benchmark (10 Run Standard)", help="Re-inizializza il benchmark ufficiale HotpotQA"):
+            if st.button("🔄 Ripristina Benchmark Ufficiale (30 Run)", help="Re-inizializza il benchmark ufficiale HotpotQA"):
                 history_db.seed_benchmark_runs(force_reseed=True)
                 st.success("Benchmark ripristinato con successo!")
                 st.rerun()

@@ -273,17 +273,49 @@ def get_history_stats(db_path: str = DB_PATH) -> Dict[str, Any]:
     }
 
 
-def seed_benchmark_runs(db_path: str = DB_PATH) -> None:
-    """Pre-popola il database con i risultati ufficiali del benchmark sui 10 campioni di HotpotQA."""
+def seed_benchmark_runs(force_reseed: bool = False, db_path: str = DB_PATH) -> None:
+    """Pre-popola il database con i risultati ufficiali del benchmark sui campioni di HotpotQA."""
     init_history_db(db_path)
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM query_runs")
     count = cursor.fetchone()[0]
+
+    if count > 0 and not force_reseed:
+        conn.close()
+        return
+
+    if force_reseed:
+        cursor.execute("DELETE FROM query_runs")
+        conn.commit()
     conn.close()
 
-    if count > 0:
-        return  # Già popolato
+    # 1. Se presente il file benchmark_30_runs.json, caricalo prioritariamente
+    json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_30_runs.json")
+    if os.path.exists(json_path):
+        with open(json_path, "r", encoding="utf-8") as f:
+            runs = json.load(f)
+        for r in runs:
+            log_query_run(
+                query=r["query"],
+                final_answer=r["final_answer"],
+                gold_answer=r.get("gold_answer", ""),
+                is_correct=bool(r["is_correct"]) if r.get("is_correct") is not None else None,
+                f1=r.get("f1_score"),
+                precision=r.get("precision"),
+                recall=r.get("recall"),
+                em=r.get("exact_match"),
+                accuracy=r.get("accuracy"),
+                num_refinement=r.get("num_refinement", 0),
+                num_planning=r.get("num_planning", 0),
+                steps_trace=r.get("steps_trace", ""),
+                reasoning=r.get("reasoning", ""),
+                retrieved_context=r.get("retrieved_context", ""),
+                feedback_history=r.get("feedback_history", ""),
+                execution_time_sec=r.get("execution_time_sec", 0.0),
+                db_path=db_path
+            )
+        return
 
     benchmark_data = [
         {

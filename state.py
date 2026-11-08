@@ -7,7 +7,7 @@ from pydantic import BaseModel
 T = TypeVar("T", bound=BaseModel)
 
 
-class GraphState(TypedDict):
+class GraphState(TypedDict, total=False):
     original_query: str
     current_query: str
     retrieved_context: str
@@ -16,6 +16,7 @@ class GraphState(TypedDict):
     next_node: str
     feedback_history: List[str]
     final_answer: str
+    retrieval_mode: Optional[str]
 
 
 def _clean_json_candidate(raw: str) -> str:
