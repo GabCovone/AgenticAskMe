@@ -244,10 +244,11 @@ with tab_exec:
                 steps_trace=steps_trace,
                 reasoning=full_reasoning_str,
                 retrieved_context=search_results,
-                execution_time_sec=exec_time
+                execution_time_sec=exec_time,
+                system_mode="baseline" if is_baseline else "full"
             )
             st.toast(f"✅ Esecuzione #{new_run_id} salvata nello storico database!", icon="💾")
-            st.caption(f"💾 *Esecuzione registrata con successo nel database locale (`agentic_history.db`, ID: #{new_run_id}). Consulta il tab '📊 Storico Esecuzioni & Benchmark' per l'analisi dettagliata e le metriche.*")
+            st.caption(f"💾 *Esecuzione registrata con successo nel database locale (`agentic_history.db`, ID: #{new_run_id}, Modalità: {'BASELINE' if is_baseline else 'FULL'}). Consulta il tab '📊 Storico Esecuzioni & Benchmark' per l'analisi dettagliata e le metriche.*")
 
 # TAB 2: Storico Esecuzioni & Benchmark
 with tab_history:
@@ -257,23 +258,56 @@ with tab_history:
     Include il calcolo trasparente delle metriche accademiche (**Grounded Accuracy, Macro F1, Exact Match, Precision, Recall**), 
     la traccia dei nodi attraversati nel grafo ciclico, il reasoning CoT/ReAct e i contesti documentali estratti.
     """)
+
+    # Filtro Modalità
+    mode_counts = history_db.get_mode_counts()
+    f_col1, f_col2 = st.columns([3, 2])
+    with f_col1:
+        selected_mode_filter = st.radio(
+            "Filtra Esecuzioni per Modalità di Sistema:",
+            [
+                f"🌐 Tutte le Modalità ({mode_counts['total']})",
+                f"🌟 Sistema Integrale - Full ({mode_counts['full']})",
+                f"🏛️ Sistema Baseline - Solo KB ({mode_counts['baseline']})"
+            ],
+            horizontal=True
+        )
+
+    mode_arg = None
+    if "Integrale" in selected_mode_filter:
+        mode_arg = "full"
+    elif "Baseline" in selected_mode_filter:
+        mode_arg = "baseline"
+
+    # Confronto rapido se sono presenti entrambe le modalità
+    if mode_counts["full"] > 0 and mode_counts["baseline"] > 0:
+        with st.expander("⚖️ Confronto Diretto di Benchmark: Sistema Integrale vs Baseline (Solo KB)", expanded=True):
+            f_stats = history_db.get_history_stats(mode="full")
+            b_stats = history_db.get_history_stats(mode="baseline")
+            c_f1, c_f2, c_f3 = st.columns(3)
+            delta_acc = f_stats['mean_accuracy'] - b_stats['mean_accuracy']
+            delta_f1 = f_stats['mean_f1'] - b_stats['mean_f1']
+            delta_em = f_stats['mean_em'] - b_stats['mean_em']
+            c_f1.metric("Grounded Accuracy (Full)", f"{f_stats['mean_accuracy']:.1f}%", delta=f"{delta_acc:+.1f}% vs Baseline")
+            c_f2.metric("Macro F1-Score (Full)", f"{f_stats['mean_f1']:.1f}%", delta=f"{delta_f1:+.1f}% vs Baseline")
+            c_f3.metric("Exact Match (Full)", f"{f_stats['mean_em']:.1f}%", delta=f"{delta_em:+.1f}% vs Baseline")
     
-    # KPI aggregate
-    stats = history_db.get_history_stats()
+    # KPI aggregate per la modalità filtrata
+    stats = history_db.get_history_stats(mode=mode_arg)
     
     kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
     kpi1.metric("🎯 Grounded Accuracy", f"{stats['mean_accuracy']:.1f}%", help="Percentuale di risposte corrette con evidenza fattuale rispetto alla Gold Answer")
     kpi2.metric("📐 Macro F1-Score", f"{stats['mean_f1']:.1f}%", help="Media dell'F1 token-level ufficiale HotpotQA/SQuAD")
     kpi3.metric("🎯 Exact Match (EM)", f"{stats['mean_em']:.1f}%", help="Accordo esatto canonico o span containment secondo Asai et al. e Yang et al.")
     kpi4.metric("📊 Precision / Recall", f"{stats['mean_precision']:.1f}% / {stats['mean_recall']:.1f}%", help="Precisione e Richiamo medi a livello di token")
-    kpi5.metric("🔢 Totale Esecuzioni", f"{stats['total_runs']}", help="Numero totale di interrogazioni registrate nel database")
+    kpi5.metric("🔢 Totale Esecuzioni", f"{stats['total_runs']}", help="Numero totale di interrogazioni registrate per la modalità attiva")
 
     st.divider()
     
     # Tabella completa delle esecuzioni
-    all_runs = history_db.get_all_runs()
+    all_runs = history_db.get_all_runs(mode=mode_arg)
     if not all_runs:
-        st.warning("Nessuna esecuzione registrata nel database.")
+        st.warning("Nessuna esecuzione registrata per la modalità selezionata.")
         if st.button("🌱 Inizializza con il Benchmark HotpotQA (30 Test)"):
             history_db.seed_benchmark_runs(force_reseed=True)
             st.rerun()
@@ -286,13 +320,15 @@ with tab_history:
             prec_val = f"{r['precision']*100:.1f}%" if r['precision'] is not None else "N/A"
             rec_val = f"{r['recall']*100:.1f}%" if r['recall'] is not None else "N/A"
             esito_icon = "✅ Corretta" if r['is_correct'] == 1 else "❌ Errata" if r['is_correct'] == 0 else "ℹ️ Info"
+            mode_badge = "🌟 Full" if r.get("system_mode") == "full" else "🏛️ Baseline"
             
             table_data.append({
                 "ID": r["id"],
+                "Modalità": mode_badge,
                 "Timestamp": r["timestamp"],
-                "Domanda Utente": r["query"][:65] + ("..." if len(r["query"]) > 65 else ""),
+                "Domanda Utente": r["query"][:60] + ("..." if len(r["query"]) > 60 else ""),
                 "Gold Answer": r["gold_answer"] if r["gold_answer"] else "-",
-                "Risposta Agente": r["final_answer"][:65] + ("..." if len(r["final_answer"]) > 65 else ""),
+                "Risposta Agente": r["final_answer"][:60] + ("..." if len(r["final_answer"]) > 60 else ""),
                 "Esito": esito_icon,
                 "Accuracy": acc_val,
                 "F1 Score": f1_val,
@@ -329,7 +365,7 @@ with tab_history:
         # Sezione Dettaglio Singola Esecuzione (Inspector)
         st.subheader("🔍 Ispezione Approfondita Esecuzione (Trace & Reasoning Inspector)")
         
-        run_options = {r["id"]: f"ID #{r['id']} | {r['query'][:65]}... ({'✅' if r['is_correct']==1 else '❌' if r['is_correct']==0 else 'ℹ️'})" for r in all_runs}
+        run_options = {r["id"]: f"ID #{r['id']} [{'🌟 Full' if r.get('system_mode')=='full' else '🏛️ Base'}] | {r['query'][:55]}... ({'✅' if r['is_correct']==1 else '❌' if r['is_correct']==0 else 'ℹ️'})" for r in all_runs}
         selected_run_id = st.selectbox(
             "Seleziona l'esecuzione da ispezionare:",
             options=list(run_options.keys()),
@@ -343,6 +379,8 @@ with tab_history:
                 with col_det_left:
                     st.markdown(f"#### ❓ Domanda:")
                     st.info(f"**{details['query']}**")
+                    mode_label = "🌟 Sistema Integrale (Full: KB + Web)" if details.get('system_mode') == 'full' else "🏛️ Sistema Baseline (Solo KB Locale)"
+                    st.caption(f"Modalità di Esecuzione: **{mode_label}** | Timestamp: `{details.get('timestamp', '-')}`")
                     
                     st.markdown(f"#### 🎯 Confronto Risposte:")
                     c_gold, c_pred = st.columns(2)

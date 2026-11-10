@@ -111,6 +111,7 @@ def init_history_db(db_path: str = DB_PATH) -> None:
         CREATE TABLE IF NOT EXISTS query_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
+            system_mode TEXT DEFAULT 'full',
             query TEXT NOT NULL,
             gold_answer TEXT,
             final_answer TEXT NOT NULL,
@@ -129,6 +130,11 @@ def init_history_db(db_path: str = DB_PATH) -> None:
             execution_time_sec REAL DEFAULT 0.0
         )
     """)
+    # Migrazione dinamica se la colonna system_mode non esiste
+    cursor.execute("PRAGMA table_info(query_runs)")
+    existing_cols = [row[1] for row in cursor.fetchall()]
+    if "system_mode" not in existing_cols:
+        cursor.execute("ALTER TABLE query_runs ADD COLUMN system_mode TEXT DEFAULT 'full'")
     conn.commit()
     conn.close()
 
@@ -150,6 +156,7 @@ def log_query_run(
     retrieved_context: str = "",
     feedback_history: Any = "",
     execution_time_sec: float = 0.0,
+    system_mode: str = "full",
     db_path: str = DB_PATH,
 ) -> int:
     """Salva una singola esecuzione nel database con metriche, passaggi e ragionamento completo."""
@@ -177,18 +184,19 @@ def log_query_run(
         fb_str = str(feedback_history or "")
 
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    mode_clean = "baseline" if str(system_mode).lower() in ("baseline", "local", "local_only", "kb_only") else "full"
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO query_runs (
-            timestamp, query, gold_answer, final_answer, is_correct,
+            timestamp, system_mode, query, gold_answer, final_answer, is_correct,
             accuracy, f1_score, precision, recall, exact_match,
             num_refinement, num_planning, steps_trace, reasoning,
             retrieved_context, feedback_history, execution_time_sec
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        ts, query, gold_answer, final_answer,
+        ts, mode_clean, query, gold_answer, final_answer,
         1 if is_correct else 0 if is_correct is not None else None,
         accuracy if accuracy is not None else (1.0 if is_correct else 0.0 if is_correct is not None else None),
         f1, precision, recall, em,
@@ -201,19 +209,29 @@ def log_query_run(
     return inserted_id
 
 
-def get_all_runs(db_path: str = DB_PATH) -> List[Dict[str, Any]]:
-    """Restituisce la lista di tutte le esecuzioni registrate, ordinate per ID decrescente."""
+def get_all_runs(mode: Optional[str] = None, db_path: str = DB_PATH) -> List[Dict[str, Any]]:
+    """Restituisce la lista di tutte le esecuzioni registrate, con filtro opzionale per system_mode ('full' o 'baseline')."""
     init_history_db(db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, timestamp, query, gold_answer, final_answer,
-               is_correct, accuracy, f1_score, precision, recall, exact_match,
-               num_refinement, num_planning, execution_time_sec
-        FROM query_runs
-        ORDER BY id DESC
-    """)
+    if mode and mode.lower() in ("full", "baseline"):
+        cursor.execute("""
+            SELECT id, timestamp, system_mode, query, gold_answer, final_answer,
+                   is_correct, accuracy, f1_score, precision, recall, exact_match,
+                   num_refinement, num_planning, execution_time_sec
+            FROM query_runs
+            WHERE LOWER(system_mode) = ?
+            ORDER BY id DESC
+        """, (mode.lower(),))
+    else:
+        cursor.execute("""
+            SELECT id, timestamp, system_mode, query, gold_answer, final_answer,
+                   is_correct, accuracy, f1_score, precision, recall, exact_match,
+                   num_refinement, num_planning, execution_time_sec
+            FROM query_runs
+            ORDER BY id DESC
+        """)
     rows = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return rows
@@ -231,12 +249,18 @@ def get_run_details(run_id: int, db_path: str = DB_PATH) -> Optional[Dict[str, A
     return dict(row) if row else None
 
 
-def get_history_stats(db_path: str = DB_PATH) -> Dict[str, Any]:
-    """Calcola le statistiche aggregate di tutte le esecuzioni storiche."""
+def get_history_stats(mode: Optional[str] = None, db_path: str = DB_PATH) -> Dict[str, Any]:
+    """Calcola le statistiche aggregate delle esecuzioni storiche, con filtro opzionale per system_mode ('full' o 'baseline')."""
     init_history_db(db_path)
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("""
+    where_clause = ""
+    params: tuple = ()
+    if mode and mode.lower() in ("full", "baseline"):
+        where_clause = "WHERE LOWER(system_mode) = ?"
+        params = (mode.lower(),)
+
+    cursor.execute(f"""
         SELECT 
             COUNT(*) as total_runs,
             AVG(accuracy) as mean_accuracy,
@@ -247,7 +271,8 @@ def get_history_stats(db_path: str = DB_PATH) -> Dict[str, Any]:
             AVG(num_refinement) as avg_refinement,
             AVG(num_planning) as avg_planning
         FROM query_runs
-    """)
+        {where_clause}
+    """, params)
     row = cursor.fetchone()
     conn.close()
     if not row or row[0] == 0:
@@ -271,6 +296,26 @@ def get_history_stats(db_path: str = DB_PATH) -> Dict[str, Any]:
         "avg_refinement": round(row[6] or 0.0, 2),
         "avg_planning": round(row[7] or 0.0, 2),
     }
+
+
+def get_mode_counts(db_path: str = DB_PATH) -> Dict[str, int]:
+    """Restituisce il conteggio delle esecuzioni suddivise per modalità di sistema."""
+    init_history_db(db_path)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT LOWER(system_mode), COUNT(*) 
+        FROM query_runs 
+        GROUP BY LOWER(system_mode)
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    counts = {"full": 0, "baseline": 0, "total": 0}
+    for m, c in rows:
+        key = "baseline" if m in ("baseline", "local", "local_only", "kb_only") else "full"
+        counts[key] = counts.get(key, 0) + c
+        counts["total"] += c
+    return counts
 
 
 def seed_benchmark_runs(force_reseed: bool = False, db_path: str = DB_PATH) -> None:
@@ -313,6 +358,7 @@ def seed_benchmark_runs(force_reseed: bool = False, db_path: str = DB_PATH) -> N
                 retrieved_context=r.get("retrieved_context", ""),
                 feedback_history=r.get("feedback_history", ""),
                 execution_time_sec=r.get("execution_time_sec", 0.0),
+                system_mode=r.get("system_mode", "full"),
                 db_path=db_path
             )
         return
