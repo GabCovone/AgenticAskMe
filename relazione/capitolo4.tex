@@ -1,0 +1,168 @@
+\chapter{Implementazione del Sistema e Valutazione Sperimentale}
+\label{chap:implementazione_valutazione}
+
+\section{Architettura Software e Dettaglio dei Moduli Implementativi}
+\label{sec:architettura_moduli}
+
+L'architettura software del sistema è stata ingegnerizzata secondo un approccio rigorosamente modulare e scalabile, superando i vincoli di monoliticità delle pipeline RAG convenzionali. L'intero framework è strutturato attorno a un grafo a stati orientato implementato mediante la libreria LangGraph, coordinato dal flusso di controllo espresso nel modulo \texttt{graph.py}.
+
+La Figura~\ref{fig:architettura_software} illustra l'architettura logica e le interazioni tra i moduli principali del sistema.
+
+\begin{figure}[htbp]
+\centering
+\fbox{
+\begin{minipage}{0.94\textwidth}
+\centering
+\vspace{0.3cm}
+{\large \textbf{Architettura Modulare del Sistema Agentic IR}}\\[0.4cm]
+
+\textbf{[Input Utente / Benchmark HotpotQA]}\\[0.15cm]
+$\Big\downarrow$ \\[0.15cm]
+\framebox[0.85\textwidth]{\textbf{VALIDATOR (Routing \& Critique Node)} -- \texttt{Validator.py}}\\[0.15cm]
+\textit{Adaptive-RAG Complexity Classifier $\mid$ Self-RAG IsRel \& IsSup $\mid$ Polar Verifier}\\[0.25cm]
+
+$\swarrow$ \hspace{4cm} $\searrow$ \\[0.15cm]
+\begin{minipage}{0.42\textwidth}
+\centering
+\framebox[\textwidth]{\textbf{REFINER} -- \texttt{Refiner.py}}\\[0.1cm]
+\footnotesize
+Least-to-Most Decomposition\\
+Entity Preservation \& Cleaning\\
+Tool: \texttt{decompose\_query}
+\end{minipage}
+\hfill
+\begin{minipage}{0.48\textwidth}
+\centering
+\framebox[\textwidth]{\textbf{PLANNER} -- \texttt{Planner.py}}\\[0.1cm]
+\footnotesize
+Multi-Step ReAct Loop\\
+Tool-Invocation Manager\\
+Tools: \texttt{local\_kb\_search}, \texttt{web\_search}
+\end{minipage}\\[0.3cm]
+
+$\nwarrow$ \hspace{4cm} $\nearrow$ \\[0.15cm]
+\framebox[0.85\textwidth]{\textbf{AGENT STATE (Memoria Transazionale Condivisa)} -- \texttt{state.py}}\\[0.25cm]
+
+$\Big\downarrow$ \\[0.15cm]
+\begin{minipage}{0.45\textwidth}
+\centering
+\framebox[\textwidth]{\textbf{Sorgenti Dati Eterogenee}}\\[0.1cm]
+\footnotesize
+Local KB: SQLite + BM25Okapi (\texttt{local\_kb.py})\\
+External Web Search: Wikipedia Live API
+\end{minipage}
+\hfill
+\begin{minipage}{0.45\textwidth}
+\centering
+\framebox[\textwidth]{\textbf{Persistenza \& Analytics}}\\[0.1cm]
+\footnotesize
+Database SQLite (\texttt{agentic\_history.db})\\
+Dashboard Interattiva (\texttt{Dashboard.py})
+\end{minipage}
+\vspace{0.3cm}
+\end{minipage}
+}
+\caption{Schema architetturale dei moduli software e delle interazioni nel framework Agentic IR.}
+\label{fig:architettura_software}
+\end{figure}
+
+Il sistema si articola su cinque componenti cooperanti che operano in modo armonico.
+
+Il primo elemento è rappresentato dal binomio formato da orchestratore e gestore dello stato. Questa componente definisce la topologia dell'automa a stati finiti e la struttura condivisa \texttt{AgentState}, curando la transizione deterministica tra i nodi e conservando la sequenza dei passaggi, le evidenze estratte, le sotto-domande generate e le risposte parziali.
+
+Il secondo elemento è il modulo di validazione, che funge da supervisore metodologico centrale. Al turno iniziale ($t=0$) valuta la complessità della domanda secondo i principi di Adaptive-RAG, decidendo se instradarla al raffinamento o direttamente alla pianificazione. Nei passi successivi esamina la sintesi proposta verificando i criteri di pertinenza ($\text{IsRel}$) e supporto fattuale ($\text{IsSup}$) di Self-RAG. Per le domande polari booleane (sì/no) applica inoltre un controllo logico di completezza, accertandosi che entrambe le entità comparate siano supportate da evidenze prima di autorizzare la chiusura formale \texttt{FINISH}.
+
+Il terzo componente è il modulo di raffinamento, preposto all'ottimizzazione linguistica delle interrogazioni composite. Adottando il Least-to-Most Prompting, riconosce le domande comparative multi-entità e le decompone in sotto-interrogazioni atomiche auto-consistenti separate dal delimitatore standard \texttt{---}, preservando l'integrità dei nomi propri ed eliminando ambiguità lessicali.
+
+Il quarto modulo è il pianificatore esecutivo, che governa il ciclo iterativo ReAct. Per ciascuna sotto-query avvia una sequenza triadica di pensieri (\textit{Thoughts}), invocazioni mirate di strumenti (\textit{Actions}) e acquisizione di riscontri (\textit{Observations}). Al termine dei passi esecutivi, il Planner produce una proposta conclusiva vincolata ai soli riscontri documentali accertati.
+
+Chiude l'architettura il motore di recupero locale (\texttt{local\_kb.py}), che gestisce l'indice lessicale probabilistico BM25Okapi, la persistenza relazionale dei testi su SQLite (\texttt{wikipedia\_local.db}) e il caching in memoria dell'indice serializzato (\texttt{bm25\_index.pkl}).
+
+\section{Piattaforma di Esecuzione, Modello LLM e Ottimizzazioni di Inferenza}
+\label{sec:piattaforma_llm}
+
+L'efficacia di un'architettura agentica complessa poggia in misura sostanziale sulla solidità logica del Large Language Model impiegato, sulla sua capacità di seguire istruzioni articolate e sull'aderenza formale a schemi di output strutturati.
+
+\subsection{Caratteristiche del Modello: Mistral-Nemo-Instruct}
+Nel nostro impianto abbiamo scelto il modello \textbf{Mistral-Nemo-Instruct-2407}. Il modello offre caratteristiche particolarmente adatte ai compiti di Agentic IR: una scala di $12,2$ miliardi di parametri che bilancia profondità di ragionamento ed efficienza computazionale; il tokenizer Tekken con un vocabolario esteso a $131.072$ token, ideale per gestire sintassi JSON e strutture formali; una finestra di contesto nativa fino a $128.000$ token, configurata nel nostro ambiente a $n_{\text{ctx}} = 8.192$ token per alloggiare lunghe cronologie ReAct e molteplici passaggi di testo; infine, la distribuzione in formato compresso binario GGUF con quantizzazione \textbf{Q5\_K\_M}, che riduce l'occupazione di memoria a circa $8,5$~GB mantenendo intatta oltre il $99\%$ dell'accuratezza rispetto al modello originale a 16 bit.
+
+\subsection{Runtime di Inferenza con Accelerazione GPU}
+L'esecuzione del modello avviene attraverso il runtime ad alte prestazioni \textbf{llama-cpp-python}, ottimizzato con kernel CUDA precaricati (\texttt{libcublas.so}, \texttt{libcudart.so}). L'offloading completo di tutti i layer sulla memoria VRAM della GPU (\texttt{n\_gpu\_layers = -1}) permette di sfruttare appieno l'accelerazione tensoriale:
+\begin{lstlisting}[language=Python]
+llm = Llama(
+    model_path="/content/AgenticAskMe/models/Mistral-Nemo-Instruct-2407-Q5_K_M.gguf",
+    n_gpu_layers=-1,
+    n_ctx=8192,
+    temperature=0.3,
+    verbose=False
+)
+\end{lstlisting}
+L'impostazione di una temperatura di decodifica conservativa ($T = 0.3$) garantisce un'elevata determinazione logica, riducendo la varianza stocastica e massimizzando la conformità sintattica nelle invocazioni dei tool e nella generazione dei token di auto-critica.
+
+\section{La Dashboard Interattiva Streamlit per l'Ispezione in Tempo Reale}
+\label{sec:dashboard}
+
+A supporto dell'architettura abbiamo realizzato un'applicazione web completa sviluppata con Streamlit, concepita per garantire trasparenza analitica, monitoraggio operativo e ispezione forense del comportamento dell'agente.
+
+\subsection{Struttura Funzionale della Dashboard}
+L'interfaccia si articola in due ambienti di lavoro principali. 
+
+Il primo ambiente è dedicato all'esecuzione live e all'analisi del grafo. Consente all'utente di sottoporre quesiti personalizzati o di selezionare esempi dal benchmark, offre la scelta della modalità di recupero (\texttt{Sistema Integrale} con Web e KB rispetto a \texttt{Sistema Baseline} con sola KB), visualizza in tempo reale lo stato attivo dei nodi di LangGraph e include un ispettore interattivo dei singoli hop ReAct, mostrando per ciascun passaggio il pensiero formulato, l'azione invocata e il testo recuperato.
+
+Il secondo ambiente gestisce la cronologia e le statistiche di benchmark. Permette di filtrare l'intero archivio storico su 60 esecuzioni complessive o per singola modalità, espone i KPI aggregati (accuratezza grounded, F1-Score, Exact Match, precision e recall) e genera in automatico un pannello di confronto diretto ($\Delta$) che evidenzia i guadagni prestazionali del sistema multi-agente. Inoltre, una sezione di ispezione approfondita consente di ripercorrere qualsiasi esecuzione registrata nel database, visualizzando la domanda, la risposta attesa, la risposta prodotta, i log di pensiero completi e le evidenze documentali estratte.
+
+\section{Protocollo Sperimentale di Valutazione e Benchmark}
+\label{sec:protocollo_sperimentale}
+
+La validazione quantitativa è stata condotta attraverso una sperimentazione rigorosa a parità di condizioni, confrontando l'agente nelle due modalità operative fondamentali: la configurazione \textbf{Baseline}, in cui l'agente è vincolato rigidamente alla sola Knowledge Base locale di Wikipedia tramite BM25, e il \textbf{Sistema Integrale}, in cui l'agente opera con piena libertà d'azione integrando la KB locale con la ricerca Web live, la decomposizione Least-to-Most e la validazione critica Self-RAG.
+
+La sperimentazione è stata condotta su un campione rigoroso di 30 interrogazioni sequenziali estratte dal subset di validazione di \textbf{HotpotQA} (\textit{fullwiki} split), comprendente sia domande a ponte sia quesiti comparativi che spaziano su entità storiche, scientifiche, cinematografiche e geografiche.
+
+Le prestazioni sono state misurate attraverso le metriche standard formalizzate nel capitolo precedente: la Grounded Accuracy (percentuale di risposte che soddisfano l'Exact Match o ottengono un $\text{F1} \ge 0.50$ supportato da evidenze), il Macro F1-Score a livello di token, l'Exact Match (EM), la Precision, la Recall e il numero medio di hop di pianificazione intrapresi per risolvere il quesito.
+
+\section{Analisi Quantitativa dei Risultati Sperimentali}
+\label{sec:risultati_quantitativi}
+
+La Tabella~\ref{tab:risultati_benchmark} sintetizza i risultati quantitativi aggregati ottenuti dal benchmark comparativo sui 30 test di HotpotQA.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabularx}{\textwidth}{l c c c}
+\toprule
+\textbf{Metrica di Valutazione} & \textbf{Sistema Baseline} & \textbf{Sistema Integrale} & \textbf{Delta Miglioramento ($\Delta$)} \\
+& \textit{(Solo KB Locale)} & \textit{(Full Multi-Agent)} & \\
+\midrule
+\textbf{Grounded Accuracy} & $26.67\%$ ($8/30$) & $\mathbf{43.33\%}$ ($13/30$) & $\mathbf{+16.66\%}$ \\
+\textbf{Macro F1-Score} & $23.67\%$ & $\mathbf{40.93\%}$ & $\mathbf{+17.26\%}$ \\
+\textbf{Exact Match (EM)} & $13.33\%$ ($4/30$) & $\mathbf{40.00\%}$ ($12/30$) & $\mathbf{+26.67\%}$ \\
+\textbf{Mean Precision} & $25.11\%$ & $\mathbf{39.19\%}$ & $\mathbf{+14.08\%}$ \\
+\textbf{Mean Recall} & $22.83\%$ & $\mathbf{47.56\%}$ & $\mathbf{+24.73\%}$ \\
+\midrule
+\textbf{Hops di Planning Medi} & $2.13$ hop & $\mathbf{1.60}$ hop & $\mathbf{-0.53}$ hop \textit{(più efficiente)} \\
+\textbf{Refinement Iterazioni Medie} & $0.20$ iter & $0.23$ iter & $+0.03$ iter \\
+\bottomrule
+\end{tabularx}
+\caption{Confronto sperimentale tra Sistema Baseline e Sistema Integrale sul benchmark HotpotQA (30 test).}
+\label{tab:risultati_benchmark}
+\end{table}
+
+\subsection{Discussione dei Risultati Quantitativi}
+Dall'analisi comparativa emergono tre riscontri empirici di particolare rilievo.
+
+In primo luogo, si osserva un netto incremento dell'accuratezza e dell'F1-Score: il Sistema Integrale registra un balzo di Grounded Accuracy del $+16,66\%$ (passando dal $26,67\%$ al $43,33\%$) e un incremento di Macro F1 del $+17,26\%$ (da $23,67\%$ a $40,93\%$). Questo divario misura direttamente il superamento del limite della KB locale: quando le entità non compaiono nei documenti pre-indicizzati, la capacità dell'agente di ricorrere a ricerche mirate sul Web colma integralmente il deficit di conoscenza.
+
+In secondo luogo, l'Exact Match cresce dal $13,33\%$ al $40,00\%$ ($+26,67\%$). Nella Baseline l'agente fatica a isolare l'esatta stringa nominale target al di fuori dei testi noti; nel Sistema Integrale, invece, la combinazione tra decomposizione della query e ricerca sul Web isola con esattezza l'entità richiesta in 12 casi su 30.
+
+Infine, sul piano dell'efficienza si riscontra una riduzione degli hop medi di pianificazione, che scendono da $2,13$ a $1,60$ per interrogazione. Mentre nella Baseline il Planner esegue tentativi infruttuosi cercando sinonimi in un indice locale privo del dato, nel Sistema Integrale la query formulata dal Refiner individua la pagina pertinente al primo colpo, accelerando la convergenza verso la risposta finale.
+
+\section{Analisi Qualitativa dei Casi Studio ed Error Analysis}
+\label{sec:analisi_qualitativa}
+
+Per comprendere a fondo il comportamento dell'agente, esaminiamo due casi studio rappresentativi e una sintesi delle limitazioni residue emerse dalle prove.
+
+Nel primo caso studio consideriamo la domanda comparativa \textit{``Were Scott Derrickson and Ed Wood of the same nationality?''}, la cui Gold Answer è \textit{``yes''}. Al turno iniziale il Validator rileva una comparazione esplicita tra due entità e instrada l'elaborazione al Refiner. Il Refiner applica la scomposizione Least-to-Most, generando le due sotto-query \textit{``What is the nationality of Scott Derrickson?''} e \textit{``What is the nationality of Ed Wood?''}. Ricevute le sotto-domande, il Validator impone il passaggio al Planner, che interroga la Knowledge Base locale scoprendo che entrambi i registi sono statunitensi. Il Planner sintetizza la proposta finale (\textit{``yes''}) e il Validator ne accerta la consistenza polare e il grounding prima di emettere l'azione conclusiva \texttt{FINISH}, raggiungendo un punteggio perfetto ($\text{Accuracy} = 1.0$, $\text{F1} = 1.00$, $\text{EM} = 1.0$).
+
+Nel secondo caso studio esaminiamo la domanda a ponte \textit{``The director of the romantic comedy Big Stone Gap was born in what town in the United States?''}, con risposta attesa \textit{``Greenwich Village, New York City''}. La configurazione Baseline interroga la KB locale senza trovare corrispondenze per il titolo del film e, priva di contesto, formula un'ipotesi generica errata (\textit{``New York City''}). Il Sistema Integrale, invece, constata l'assenza locale e attiva una ricerca Web su Big Stone Gap, identificando la regista Adriana Trigiani. Al secondo hop, l'agente interroga il Web sul luogo di nascita della regista, recuperando con esattezza sia la città sia il quartiere (\textit{``Greenwich Village, New York City''}) e ottenendo una validazione fattuale ineccepibile.
+
+Dall'analisi degli errori sul Sistema Integrale emergono due schemi principali di fallimento. Da un lato riscontriamo discrepanze di granularità numerica: in quesiti quantitativi l'agente a volte estrae la capienza complessiva di una struttura anziché i soli posti a sedere indicati nella risposta attesa, generando una divergenza formale pur avendo compreso il contesto. Dall'altro lato emergono ambiguità nei confronti temporali: se i testi recuperati riportano la data di nascita di uno solo dei due soggetti confrontati, l'agente rischia di produrre una sintesi parziale prima che il supervisore riesca a intercettare la carenza. Questi comportamenti indicano con chiarezza le aree su cui concentrare i futuri affinamenti del sistema.

@@ -355,7 +355,7 @@ with tab_history:
                 mime="text/csv"
             )
         with col_reseed:
-            if st.button("🔄 Ripristina Benchmark Ufficiale (30 Run)", help="Re-inizializza il benchmark ufficiale HotpotQA"):
+            if st.button("🔄 Ripristina Benchmark Ufficiale", help="Re-inizializza il benchmark ufficiale HotpotQA (Full e Baseline)"):
                 history_db.seed_benchmark_runs(force_reseed=True)
                 st.success("Benchmark ripristinato con successo!")
                 st.rerun()
@@ -499,7 +499,7 @@ with tab_arch:
     A differenza del RAG lineare tradizionale, questo sistema implementa un grafo ciclico ad anello continuo:
     1. **Validator**: Agisce da *Conductor* (input routing iniziale) e *Judge* (valutazione output e critique tokens Self-RAG).
     2. **Refiner**: Riformula e decompone le query senza effettuare retrieval (Least-to-Most, Rewrite-Retrieve-Read).
-    3. **Planner**: Pianifica ed esegue retrieval multi-step scegliendo tra **KB Locale (FTS5/BM25)** e **Web (DuckDuckGo)**.
+    3. **Planner**: Pianifica ed esegue retrieval multi-step scegliendo tra **KB Locale (FTS5/BM25)** e **Web Esterno (Wikipedia Live API)**.
     """)
     
     st.code("""

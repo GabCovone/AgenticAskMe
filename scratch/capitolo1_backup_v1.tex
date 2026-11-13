@@ -1,0 +1,121 @@
+\chapter{Introduzione all'Agentic AI nell'Information Retrieval}
+\label{chap:introduzione}
+
+\section{Contesto ed Evoluzione dell'Information Retrieval: Dal Lexical Search ai Sistemi Agentici}
+\label{sec:contesto_evoluzione}
+
+L'Information Retrieval (IR) costituisce uno dei pilastri fondamentali dell'informatica moderna, preposto all'individuazione, estrazione e indicizzazione di informazioni non strutturate da vaste collezioni documentali in risposta a uno specifico bisogno informativo espresso dall'utente (\textit{information need}). Storicamente, l'evoluzione dei paradigmi di Information Retrieval può essere scandita attraverso tre generazioni concettuali distinte:
+\begin{enumerate}
+    \item \textbf{Modelli Lessicali e Probabilistici}: Basati sull'ipotesi che la rilevanza di un documento sia correlata alla frequenza e alla distribuzione dei termini della query condivisi con il testo. Modelli classici quali il modello Booleano, lo spazio vettoriale (Vector Space Model con pesatura TF-IDF) e le formulazioni probabilistiche del \textit{Probabilistic Relevance Framework} culminate nell'algoritmo BM25 \cite{robertson2009probabilistic}, hanno dominato la scena per decenni grazie alla loro eccezionale scalabilità computazionale e solidità teorica. Tuttavia, tali approcci soffrono intrinsecamente del divario di vocabolario (\textit{vocabulary mismatch problem}), fallendo nell'interpretare sinonimi, relazioni tassonomiche o sfumature semantiche contestuali.
+    \item \textbf{Modelli Densi e Semantici (Dense Retrieval)}: Con l'avvento dei modelli di linguaggio basati su architettura Transformer, il paradigma si è spostato verso il recupero neurale denso (Dense Passage Retrieval, Bi-Encoders e Cross-Encoders) \cite{karpukhin2020dense}. I documenti e le interrogazioni vengono proiettati in uno spazio vettoriale continuo latente $\mathbb{R}^d$, in cui la prossimità semantica è quantificata tramite misure geometriche di similarità (prodotto scalare o similarità coseno). Pur superando il problema del vocabolario, i modelli densi standard rimangono strutturalmente passivi: assumono che la risposta al bisogno informativo sia interamente contenuta all'interno di un singolo segmento testuale isolato (\textit{single-shot retrieval}) e manifestano una marcata degradazione prestazionale quando confrontati con query complesse che richiedono composizionalità logica o dati al di fuori della distribuzione di addestramento.
+    \item \textbf{Retrieval-Augmented Generation (RAG) Tradizionale e i Suoi Limiti}: L'integrazione di Large Language Models (LLM) con meccanismi di recupero documentale ha dato origine ai sistemi RAG convenzionali (\textit{Naïve RAG}). In tale schema, un motore di ricerca recupera i primi $k$ passaggi rilevanti, i quali vengono concatenati all'interno del contesto dell'LLM per generare la risposta finale. Sebbene la RAG riduca le allucinazioni parametriche del modello, essa evidenzia severi limiti strutturali:
+    \begin{itemize}
+        \item \textit{Assenza di reattività}: Il recupero avviene in un unico passaggio cieco. Se i passaggi estratti non contengono l'evidenza risolutiva o risultano rumorosi, il generatore sintetizza risposte errate o fuorvianti senza possibilità di appello.
+        \item \textit{Inadeguatezza per query multi-hop}: Quando il soddisfacimento del bisogno informativo richiede l'aggregazione di evidenze disgiunte e sequenziali (ad esempio: \textit{"Chi è il regista del film vincitore dell'Oscar 2024 e dove ha conseguito la laurea?"}), il retrieval a singolo passaggio non è in grado di formulare la query intermedia necessaria senza aver prima risolto la prima incognita.
+        \item \textit{Mancanza di auto-valutazione}: Il sistema non valuta criticamente se i documenti recuperati siano effettivamente rilevanti rispetto all'intento dell'utente o se la risposta generata sia strettamente ancorata (\textit{grounded}) alle evidenze fornite.
+    \end{itemize}
+\end{enumerate}
+
+Per superare queste barriere architettoniche, la ricerca più recente ha promosso la convergenza tra Information Retrieval e Agentic AI, delineando il nuovo paradigma dell'\textbf{Agentic Information Retrieval (Agentic IR)} \cite{zhang2024ai, wu2025agentic}. In questo contesto, l'Information Retrieval cessa di essere una procedura rigida e unidirezionale di classificazione passiva dei documenti e si trasforma in un processo esplorativo attivo, guidato da agenti intelligenti capaci di interagire dinamicamente con l'ambiente, orchestrare strumenti computazionali eterogenei e adattare ricorsivamente la propria strategia investigativa.
+
+---
+
+\section{Fondamenti e Proprietà Cardine dell'Agentic AI in Ambito IR}
+\label{sec:fondamenti_agentic}
+
+Un sistema di intelligenza artificiale viene definito \textbf{agentico} quando manifesta una capacità intrinseca di \textit{agency}, ossia l'abilità di perseguire autonomamente obiettivi complessi di alto livello mediante cicli deliberativi di percezione, pianificazione, esecuzione di azioni e riflessione critica sull'ambiente circostante.
+
+Formalmente, un agente per l'Information Retrieval può essere modellato come un decisore operante su uno spazio di stati $\mathcal{S}$, un insieme di azioni ammissibili $\mathcal{A}$ e uno spazio di osservazioni $\mathcal{O}$. Dato un bisogno informativo espresso dall'utente mediante una query iniziale $q_0$, il ciclo operativo dell'agente si articola secondo il principio ciclico \textbf{Percezione $\rightarrow$ Ragionamento $\rightarrow$ Azione $\rightarrow$ Feedback}:
+\begin{equation}
+    s_t = \tau(s_{t-1}, a_{t-1}, o_t), \quad a_t \sim \pi(a \mid s_t, q_0)
+\end{equation}
+dove $\tau$ rappresenta la funzione di transizione dello stato interno (che memorizza la cronologia dei passaggi, le evidenze raccolte e i fallimenti precedenti), $o_t \in \mathcal{O}$ è l'osservazione restituita dall'ambiente all'istante $t$ (ad esempio, il contenuto dei passaggi estratti da una sorgente documentale), e $\pi$ è la politica deliberativa guidata dall'LLM.
+
+Come evidenziato dalle linee guida accademiche e dalla letteratura di riferimento, un'architettura Agentic IR matura si caratterizza per quattro proprietà fondamentali:
+
+\subsection{Autonomia Operativa e Reattività Adattiva}
+A differenza dei modelli reattivi che si limitano a produrre un output token-per-token in risposta a un prompt fisso, l'agente opera con discrezionalità strategica: analizza la complessità della query, stima il proprio livello di incertezza e determina autonomamente quando il contesto informativo raccolto è sufficiente per generare la risposta finale o se siano necessarie ulteriori iterazioni investigative \cite{jeong2024adaptiverag}.
+
+\subsection{Goal-Directed Planning e Decomposizione Gerarchica}
+Di fronte a problemi informativi composti, l'agente non esegue interrogazioni casuali, ma formula piani d'azione strutturati. Attraverso paradigmi come il \textit{Least-to-Most Prompting} \cite{zhou2022leasttomost} e il framework \textit{ReAct} (Reasoning + Acting) \cite{yao2022react}, l'agente decompone una query globale complessa in una sequenza ordinata di sotto-problemi atomici (\textit{sub-queries}) dipendenti o indipendenti, risolvendo ciascun frammento mediante passaggi d'inferenza intermedi:
+\begin{equation}
+    q_0 \xrightarrow{\text{Decomposizione}} \{q_1, q_2, \dots, q_m\}, \quad q_i = f(q_0, o_{<i})
+\end{equation}
+in cui la formulazione della sotto-query $q_i$ può dipendere semanticamente dalle risposte parziali ottenute per le sotto-query precedenti $q_{<i}$.
+
+\subsection{Integrazione e Orchestrazione di Tool Eterogenei (Tool Augmentation)}
+Un agente di IR non è confinato ai pesi del proprio modello parametrico né a un singolo indice locale. Esso dispone di un registro di strumenti (\textit{Tool Registry}) che include:
+\begin{itemize}
+    \item Motori di ricerca lessicali su indici invertiti locali (ad es. implementazioni BM25 per documentazione verificata e ad alta velocità);
+    \item API di motori di ricerca su larga scala sul Web (per il reperimento di informazioni fresche, dati di attualità o entità della coda lunga);
+    \item Basi di conoscenza strutturate (Knowledge Graphs, basi di dati relazionali SQL/NoSQL).
+\end{itemize}
+L'agente sintetizza la chiamata allo strumento, genera gli argomenti d'interrogazione mirati, interpreta l'output restituito e incorpora i risultati nell'accumulatore di contesto.
+
+\subsection{Autocritica e Ragionamento Auto-Riflessivo (Self-Reflection \& Grounding)}
+L'agente implementa meccanismi di validazione metacognitiva per valutare la qualità dell'informazione reperita, ispirandosi ai principi di \textit{Self-RAG} \cite{asai2023selfrag}. Esso valuta sistematicamente:
+\begin{enumerate}
+    \item \textbf{Relevance Critique ($\text{IsRel}$)}: I passaggi recuperati contengono informazioni effettivamente pertinenti alla domanda o introducono rumore non correlato?
+    \item \textbf{Supportiveness Critique ($\text{IsSup}$)}: La risposta proposta è interamente deducibile e comprovata dalle evidenze documentali estratte, oppure introduce speculazioni prive di fondamento fattuale (\textit{hallucinations})?
+\end{enumerate}
+Qualora i criteri di grounding non siano soddisfatti, l'agente rifiuta la risposta e re-instrada il flusso operativo verso una fase di raffinamento della query o di pianificazione correttiva.
+
+---
+
+\section{Definizione del Problema e Sfide Aperte nell'IR Complesso}
+\label{sec:definizione_problema}
+
+L'obiettivo cardine di questa ricerca risiede nella progettazione, implementazione e validazione empirica di un'architettura agentica autonoma per compiti di Information Retrieval complessi.
+
+Nel recupero di informazioni su larga scala, la maggior parte delle interrogazioni del mondo reale non si presenta nella forma di semplici domande a risposta diretta su singole entità ben note (\textit{factoid single-hop queries}), bensì come interrogazioni composite che sollevano tre principali sfide aperte:
+
+\subsection{La Sfida delle Query Multi-Hop e Comparative}
+Nei benchmark avanzati di Information Retrieval e Question Answering (quali HotpotQA \cite{yang2018hotpotqa}), le domande richiedono tipicamente di individuare e concatenare informazioni distribuite su molteplici documenti non correlati a priori. Si distinguono due classi strutturali critiche:
+\begin{itemize}
+    \item \textbf{Bridge Questions (Domande a Ponte)}: Per identificare l'entità target finale, occorre prima determinare un'entità intermedia che funge da "ponte". Esempio: \textit{"Quale altra scuderia di Formula 1 ha guidato il pilota che ha vinto il Gran Premio di Monaco nel 1996?"}. Un motore tradizionale interrogherà l'indice con l'intera frase, trovando documenti generici sul GP del 1996 ma fallendo nel collegare l'informazione che il pilota è Olivier Panis, per poi cercare le altre scuderie guidate da Panis.
+    \item \textbf{Comparison Questions (Domande Comparative Multi-Entità)}: Interrogazioni che mettono a confronto attributi di due o più entità distinte. Esempio: \textit{"Scott Derrickson ed Ed Wood erano della stessa nazionalità?"}. La query richiede di estrarre in parallelo o in sequenza la nazionalità di Derrickson (statunitense), quella di Wood (statunitense), e infine applicare un'operatore di uguaglianza booleana per concludere con successo.
+\end{itemize}
+
+\subsection{Il Divario Informativo (Information Gap) e il Semantic Drift}
+Spesso gli utenti formulano interrogazioni affette da polisemia, ambiguità lessicale o sotto-specificazione. In un sistema RAG convenzionale, l'esecuzione di una ricerca su una query ambigua produce documenti fuorvianti; l'LLM, condizionato da tali documenti, genera una risposta errata che consolida il fenomeno del \textit{semantic drift} (deriva semantica). Risulta dunque indispensabile un'unità specializzata di \textit{Query Refinement} che ri-scriva, espanda termini sinonimi o disambigui le entità prima o durante il recupero.
+
+\subsection{La Gestione del Trade-Off tra Efficienza, Allucinazioni e Copertura}
+Un'ulteriore sfida critica riguarda il bilanciamento tra l'utilizzo di una Knowledge Base locale (sicura, deterministica, ad altissima velocità di consultazione ma intrinsecamente circoscritta nel vocabolario) e motori di ricerca Web aperti (vastissima copertura ma soggetti a rumore, formati eterogenei e latenza di rete). Un agente avanzato deve saper coordinare entrambe le sorgenti, sfruttando la memoria locale come primo livello di cache semantica e ricorrendo al web unicamente per colmare specifici deficit di conoscenza.
+
+---
+
+\section{Obiettivi del Progetto e Contributi della Ricerca}
+\label{sec:obiettivi_contributi}
+
+Il presente progetto, sviluppato nell'ambito del corso di \textit{Information Retrieval} presso l'Università degli Studi di Napoli Federico II (Laboratorio IKNOS-DIETI), affronta in modo integrato i task ufficiali delineati nella traccia d'esame (Tabella~1 del documento di specifica):
+\begin{itemize}
+    \item \textbf{Autonomous Query Refinement}: Analisi dell'intento dell'utente, rilevamento della complessità strutturale e decomposizione di query complesse in sotto-query atomiche (\textit{Least-to-Most decomposition}), con riscrittura e ripulitura lessicale.
+    \item \textbf{Multi-Step Retrieval Planning}: Formulazione ed esecuzione di piani investigativi multi-hop mediante cicli iterativi ReAct, orchestrando passaggi di recupero progressivi e integrando evidenze parziali.
+    \item \textbf{Tool-Augmented Retrieval}: Integrazione ibrida tra un indice locale probabilistico basato su BM25 (costruito su un corpus enciclopedico di riferimento) e strumenti di Web Search in tempo reale per estendere dinamicamente il perimetro di conoscenza.
+    \item \textbf{Self-Reflective Validation and Fact Checking}: Verifica critica sistematica (ispirata a Self-RAG e Adaptive-RAG) dello stato di avanzamento, della pertinenza delle evidenze raccolte e della rigorosa aderenza fattuale (\textit{grounding}) della risposta proposta prima della terminazione del grafo.
+\end{itemize}
+
+\subsection{L'Architettura Proposta a Grafo di Stati (LangGraph)}
+L'infrastruttura ingegnerizzata abbandona la linearità delle pipeline tradizionali in favore di un grafo orientato a stati finiti implementato mediante \textbf{LangGraph}, in cui lo stato globale dell'investigazione (\textit{Agentic State}) fluisce attraverso tre nodi agentici specializzati:
+\begin{enumerate}
+    \item \textbf{Validator (Adaptive Routing \& Critique Node)}: Funge da supervisore e controllore centrale del flusso. Esamina la complessità della query originale secondo i principi di \textit{Adaptive-RAG}, decide se instradarla al raffinamento o alla pianificazione diretta, e valida l'output generato mediante controlli di consistenza logica e polarità booleana.
+    \item \textbf{Refiner (Autonomous Query Refinement Node)}: Specializzato nella manipolazione semantica della query. Riconosce le domande comparative e a ponte, applica la decomposizione Least-to-Most generando sotto-interrogazioni atomiche auto-consistenti e preserva la coerenza referenziale.
+    \item \textbf{Planner (Multi-Step ReAct Retrieval Planning Node)}: Esegue l'esplorazione documentale vera e propria. Per ciascuna sotto-query, avvia un ciclo ReAct multi-hop alternando pensieri analitici (\textit{Thoughts}), azioni di recupero mirate (\textit{Actions}: ricerca locale BM25 o ricerca Web) e interpretazione delle evidenze restituite (\textit{Observations}), sintetizzando infine una risposta fondata sui soli fatti provati.
+\end{enumerate}
+
+\subsection{Valutazione Sperimentale Rigorosa}
+Per validare empiricamente l'efficacia del framework rispetto a una baseline classica vincolata alla sola Knowledge Base locale, è stato implementato un protocollo di benchmark oggettivo sul subset di validazione di \textbf{HotpotQA} \cite{yang2018hotpotqa}, valutando le prestazioni attraverso le metriche standard della letteratura di Information Retrieval: \textit{Grounded Accuracy}, \textit{Token-level Macro F1-Score}, \textit{Exact Match (EM)}, \textit{Precision} e \textit{Recall}. I risultati sperimentali (esposti in dettaglio nel Capitolo~\ref{chap:implementazione_valutazione}) dimostrano come il coordinamento multi-agente incrementi l'accuratezza dal $26.7\%$ della baseline al $43.3\%$ del sistema integrale, confermando l'ipotesi che la combinazione di decomposizione della query, pianificazione ReAct e verifica di grounding consenta di superare drasticamente i limiti strutturali dell'IR classico.
+
+---
+
+\section{Struttura della Relazione}
+\label{sec:struttura_relazione}
+
+Il presente documento è organizzato in conformità con le direttive del corso di Information Retrieval e si articola nei seguenti capitoli:
+\begin{itemize}
+    \item \textbf{Capitolo~\ref{chap:dati_preprocessing} - Dati e Preprocessing}: Descrive i dataset di riferimento utilizzati per l'addestramento e il benchmarking (con particolare attenzione al dataset HotpotQA per compiti multi-hop e a Wikipedia come corpus documentale), illustrando le tecniche di normalizzazione testuale, indicizzazione BM25 e strutturazione dei contesti documentali.
+    \item \textbf{Capitolo~\ref{chap:metodologie} - Metodologie di Retrieval e Ragionamento Agentico}: Approfondisce le fondamenta teoriche e algoritmiche adottate nel framework: il paradigma ReAct per l'esplorazione guidata da tool, l'Adaptive-RAG per la classificazione dinamica della complessità delle query, il Least-to-Most prompting per la decomposizione composizionale, e i meccanismi di Self-RAG per l'autocritica e la mitigazione delle allucinazioni.
+    \item \textbf{Capitolo~\ref{chap:implementazione_valutazione} - Implementazione del Sistema, Valutazione Sperimentale e Risultati}: Espone dettagliatamente l'architettura software del framework multi-agente basato su LangGraph, la persistenza dello stato su database SQLite relazionale, la Dashboard interattiva sviluppata in Streamlit per l'ispezione real-time e l'analisi quantitativa comparativa tra il Sistema Integrale e la Baseline su HotpotQA.
+    \item \textbf{Capitolo~\ref{chap:conclusioni} - Conclusioni e Sviluppi Futuri}: Riassume i principali contributi scientifici e ingegneristici del lavoro, discute i limiti intrinseci emersi dalle evidenze sperimentali e delinea le direzioni di ricerca future, incluse le possibili estensioni verso tesi di laurea magistrale in ambiti specialistici (quali l'analisi spazio-temporale o la sicurezza informatica).
+\end{itemize}
+

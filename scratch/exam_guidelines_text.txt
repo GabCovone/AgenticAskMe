@@ -1,0 +1,314 @@
+
+
+================ PAGE 1 ================
+
+Agentic AI for Information Retrieval
+Dr. Domenico Benfenati
+IKNOS-DIETI Lab - University of Naples Federico II
+Course of Information Retrieval - Prof. Antonio Maria Rinaldi
+A.Y. 2024/2025
+Abstract
+This document presents the homework of the Information Retrieval course for the academic
+year 2024/2025, concerning the use of AI agents for Information retrieval tasks.
+1 Problem Introduction
+Agentic AI refers to a class of artificial intelligence systems designed to operate with autonomy, pur-
+sue complex goals, and adaptively interact with dynamic environments. Unlike traditional AI models
+that passively respond to input, agentic systems proactively seek information, decompose tasks, de-
+vise strategies, and execute actions—often through the integration of tools, APIs, and external data
+sources. These systems ingest and analyze vast amounts of data, enabling them to make decisions
+with limited supervision and act independently across diverse contexts, including robotics, software
+development, and virtual assistance 1. Agentic AI combines the generative and flexible capabilities of
+large language models (LLMs) with the structured accuracy of traditional programming paradigms.
+While generative AI is primarily reactive—producing content such as text, images, or code in response
+to prompts—agentic AI exhibits agency, meaning it can autonomously plan and execute actions toward
+a goal using techniques such as natural language processing, machine learning, reinforcement learning,
+and knowledge representation2. In the domain of Information Retrieval (IR), the integration of agentic
+capabilities represents a paradigm shift from static document ranking to interactive, context-aware,
+and user-aligned retrieval systems. Agentic IR agents can dynamically refine queries, traverse knowl-
+edge graphs, interact with databases, validate factual information, and even invoke external APIs to
+augment results. For instance, such a system might autonomously break down a complex informa-
+tion need into sub-questions, retrieve relevant documents from distributed sources, and synthesize a
+coherent answer. These capabilities are actively being explored in current AI research and industry
+initiatives, such as OpenAI’s AutoGPT and Microsoft’s Jarvis, which aim to extend the reasoning and
+planning abilities of LLMs into more autonomous, decision-making agents.
+1NVIDIA Agentic AI
+2IBM Agentic AI
+1
+
+================ PAGE 2 ================
+
+2 State-of-the-Art
+The integration of agentic AI into information retrieval (IR) systems has catalyzed the development
+of autonomous agents capable of dynamic reasoning, tool utilization, and adaptive interaction with
+complex data environments.
+Agentic Information Retrieval (Agentic IR): This conceptual framework reimagines IR by leveraging
+large language models (LLMs) as autonomous agents. These agents are designed to perform multi-
+step reasoning, employ retrieval-augmented generation (RAG), and utilize tools such as web search
+and code execution to fulfill complex information needs. The approach emphasizes techniques like
+prompt engineering, reflection, and multi-agent collaboration to enhance retrieval performance and
+adaptability [1].
+Agentic Reasoning Framework: This framework enhances LLM reasoning by integrating external tool-
+using agents. It introduces a ”Mind Map” agent that constructs structured knowledge graphs to track
+logical relationships, improving deductive reasoning. By incorporating web search and coding agents,
+the system enables real-time retrieval and computational analysis, demonstrating significant improve-
+ments in complex scientific reasoning tasks [2].
+PaperQA performs information retrieval across full-text scientific articles, assesses the relevance of
+sources, and synthesizes answers. It surpasses existing LLMs and agents on science QA benchmarks
+and introduces LitQA, a benchmark requiring retrieval and synthesis from full-text scientific papers
+[3].
+CollEX: This multimodal agentic RAG system facilitates interactive exploration of extensive scientific
+collections. By employing large vision-language models as multimodal agents within a chat interface,
+CollEX supports curiosity-driven exploration, integrating textual and visual modalities to aid educa-
+tors and researchers in accessing diverse scientific records [4].
+Agentic Contextual Retrieval in Telecommunications: In the realm of intelligent communications
+and networking, agentic AI enables AI-driven agents to perceive, reason, decide, and act within
+dynamic networking environments. By integrating multi-source retrieval, structured reasoning, and
+self-reflective validation, agentic contextual retrieval frameworks enhance decision-making in telecom
+applications, such as network planning and resource allocation [5].
+These advancements illustrate the transformative potential of agentic AI in information retrieval, en-
+abling systems to move beyond static query-response models toward dynamic, context-aware, and
+goal-directed information access.
+3 Project Information
+This project aims to develop a strategy and framework in the domain of agentic artificial intelligence
+for information retrieval systems. The system will leverage agentic capabilities to perform one or more
+of the tasks described in Table 1.
+3.1 Data
+A comprehensive collection of open-source datasets for training and evaluating agentic AI models is
+available at this site. Some of the most widely used datasets, along with a brief overview of their
+characteristics, are summarized in Table 2.
+4 Project Document Structure
+Students must provide all the assignment materials to the teacher at most 7 days before the exam
+date they want to participate to. Project files to deliver must include:
+• Source code of the project (in a compressed file or a Github repository)
+• Project Report as PDF file
+• Configuration files and additional documentation, if any.
+The project document follows a structured approach to guide the development of an Agentic AI system
+for Information Retrieval. The content will be adapted based on the specific retrieval task chosen by
+the student while ensuring a comprehensive discussion of data, methodologies, system design, and
+2
+
+================ PAGE 3 ================
+
+Task Description Goal in Information Retrieval
+Autonomous Query Refinement
+An agentic IR system generates and iteratively refines
+search queries by analyzing user intent, intermediate re-
+sults, and feedback loops. It may decompose broad infor-
+mation needs into sub-queries, rephrase terms, or expand
+synonyms to narrow or broaden the search.
+Improve retrieval precision and recall by dynamically
+adapting queries to user goals and contextual signals, re-
+ducing reliance on manual query engineering.
+Multi-Step Retrieval Planning
+This task involves planning a sequence of retrieval
+actions—such as initial document search, knowledge
+graph navigation, targeted API calls, and focused sub-
+searches—to address complex information needs. The
+agent constructs an action plan and adjusts it as new in-
+formation arrives.
+Enable end-to-end, goal-driven retrieval workflows that
+can handle compound questions, multi-hop reasoning, and
+cross-source synthesis.
+Tool-Augmented Retrieval
+Agents leverage external tools (e.g., web search APIs, code
+execution engines, databases) within the retrieval loop.
+They decide which tools to invoke, format inputs, and in-
+tegrate outputs into their reasoning chain.
+Extend the scope of retrieval beyond static corpora by
+incorporating real-time data, computations, and domain-
+specific services to enrich answer generation.
+Knowledge Graph Traversal
+This task focuses on navigating structured knowledge rep-
+resentations (ontologies, semantic graphs) to retrieve enti-
+ties, relationships, and context. The agent selects traversal
+paths, applies reasoning rules, and extracts subgraphs rel-
+evant to the query.
+Provide semantically coherent and explainable retrieval re-
+sults by leveraging graph structure, enabling precise entity
+linking and relationship discovery.
+Self-Reflective Validation and Fact Checking
+Agents perform internal evaluation of retrieved content
+by cross-referencing multiple sources, checking consistency,
+and assessing confidence scores. They may trigger addi-
+tional searches or tool calls to resolve contradictions or ver-
+ify claims.
+Enhance result reliability and user trust by automatically
+validating facts, reducing hallucinations, and flagging un-
+certain information.
+Table 1: Possible tasks for Agentic AI in Information Retrieval
+Dataset Description Data Type Task Links*
+The Pile The Pile is an extensive, diverse dataset comprising
+roughly 800GB of text drawn from sources like ArXiv,
+GitHub, Wikipedia, and more. It has been meticu-
+lously compiled to offer a wide spectrum of writing
+styles and subject matter, making it ideal for training
+large-scale language models.
+Textual Train, Fine-
+tuning, NLP
+Kaggle
+Paper
+Official Site
+Common
+Crawl
+Common Crawl aggregates billions of web pages
+scraped on a monthly basis, offering a true web-scale
+dataset. Its vast collection captures diverse content
+from across the internet, making it a foundational re-
+source for training robust language models.
+Textual Search En-
+gine, Web
+Language
+Models
+Kaggle
+Paper
+Official Site
+WikiText WikiText is an open-source language modeling dataset
+derived from high-quality Wikipedia articles. It re-
+tains the rich structure and linguistic complexity found
+in editorial content, offering models a challenging en-
+vironment to learn long-range dependencies. It also
+features a far larger vocabulary and retains the origi-
+nal case, punctuation and numbers.
+Textual Training,
+Bench-
+marking,
+Fine-tuning
+Kaggle
+Paper
+Official Site
+OpenWebText OpenWebText is an open-source effort to recreate the
+WebText dataset originally used by OpenAI for lan-
+guage modeling. Compiled from web pages linked on
+Reddit, it provides a diverse collection of high-quality
+internet text.
+Textual Train, Fine-
+tuning, NLP
+Kaggle
+GitHub
+Official Site
+LAION-5B LAION-5B is an enormous dataset containing 5.85 bil-
+lion image-text pairs, providing an unprecedented re-
+source for multimodal AI. Its scale and diversity sup-
+port the training of cutting-edge text-to-image models
+like Stable Diffusion and DALL ·E.
+Image, Text Training,
+Multimodal
+AI, Genera-
+tive AI
+Kaggle
+Paper
+Official Site
+*Always check for eventual updates of links and datasets via a web search
+Table 2: Commonly-used dataset for Agentic AI and Generative AI
+3
+
+================ PAGE 4 ================
+
+evaluation.
+Chapter 1: Introduction to Agentic AI in Information Retrieval
+This chapter provides an overview of agentic artificial intelligence and its transformative potential
+for modern information retrieval systems. It introduces the core concepts of autonomy, goal-directed
+planning, tool integration, and adaptive reasoning, and discusses the challenges of retrieving relevant
+information in complex, large-scale corpora. The chapter frames the central problem—designing an
+IR agent that can interpret user intents, decompose multifaceted queries, and orchestrate multi-step
+retrieval workflows—and outlines the objectives of the proposed agentic IR framework.
+Chapter 2: Data and Preprocessing
+This section describes the datasets and knowledge sources relevant to agentic information retrieval. It
+reviews common IR corpora alongside structured resources (knowledge graphs, APIs) and details the
+preprocessing techniques required to support downstream agentic reasoning.
+Chapter 3: Retrieval Methodologies
+This chapter examines the spectrum of agentic retrieval approaches. For each methodology used,
+the underlying mechanisms are analyzed in terms of their advantages and suitability for different IR
+scenarios. The role of large language models, reinforcement learning, and external tool integration is
+highlighted throughout.
+Chapter 4: System Implementation and Evaluation
+This chapter details the design and implementation of the agentic IR system, describing its core mod-
+ules—query planner, tool-invocation manager, retrieval engine, and validation component—and their
+interactions. It discusses architectural considerations, indexing strategies, and orchestration of exter-
+nal APIs for real-time data enrichment. The evaluation framework is defined, including benchmarks,
+relevance metrics, and agent-specific measures, and results are compared against baseline IR systems.
+Chapter 5: Conclusions and Future Work
+The final chapter summarizes the key contributions of integrating agentic AI into information re-
+trieval, reflects on empirical findings, and discusses broader implications for search and knowledge
+management. It reviews the framework’s limitations and outlines directions for future research, in-
+cluding multi-agent coordination, enhanced fact-checking modules, and application to domain-specific
+retrieval (e.g., legal, biomedical).
+Possible Thesis Extention
+The exam project can be extended into a Master’s thesis with several advanced research directions.
+Some examples of possible Master’s thesis directions are explained in detail below.
+Agentic Query Decomposition for Spatio-Temporal Analysis
+Approach : Designing an agentic query planner that autonomously decomposes complex, time-
+series Earth observation requests into a sequence of targeted retrieval subtasks (e.g., “identify defor-
+estation hotspots, then retrieve seasonal change imagery”).
+Application : Users pose high-level, spatio-temporal questions (e.g., “Track urban growth and
+vegetative health in the Po Valley over the last decade”), and the agent orchestrates multi-step searches,
+combining CBIR, change detection, and metadata queries.
+Method :
+• Implement a planning agent based on an LLM with hierarchical task decomposition.
+• Integrate temporal retrieval modules that call different archives/APIs for each time slice.
+4
+
+================ PAGE 5 ================
+
+• Use a tool-invocation manager to coordinate CBIR, change detection, and multi-modal re-
+trieval agents in sequence.
+Tool-Augmented Agentic Retrieval with Geo-Analytics
+Approach : Embedding an agentic orchestration layer that dynamically selects and invokes
+specialized geo-analytics tools (e.g., NDVI calculators, DEM processors, climate model APIs) within
+the retrieval pipeline [6].
+Application : A researcher asks, “Show areas of significant vegetation stress correlated with eleva-
+tion changes,” and the agent fetches imagery, runs analytics, and synthesizes results.
+Method :
+• Develop a tool registry mapping LLM tool-calls to geo-processing functions (e.g., QGIS scripts,
+API endpoints).
+• Implement real-time API connectors for on-the-fly computation (e.g., Google Earth Engine).
+• Enable chain-of-thought prompts in the LLM to determine when to call each geo-tool and
+how to integrate outputs.
+Self-Reflective Fact-Checking in Multi-Modal Retrieval
+Approach : Incorporating a self-validation agent that cross-references retrieved satellite images
+and metadata against external authoritative sources (e.g., land-use registries, scientific publications)
+before presenting results.
+Application : When asked, “Verify recent flood extent in the Danube Delta,” the system retrieves
+imagery, then autonomously validates the observations against hydrological reports and machine-read
+publications.
+Method :
+• Implement multi-source cross-verification routines using both RAG and structured-data
+APIs.
+• Use an LLM-based confidence scoring module that triggers additional searches for low-
+confidence findings.
+• Present a fact-check summary that includes provenance annotations and uncertainty esti-
+mates.
+Agentic AI Systems for Software Vulnerabilities 1
+Approach : Deploying an autonomous vulnerability agent that continuously audits software
+artifacts, reasons about potential threats, and proposes mitigations by simulating adversarial behaviors
+and consulting exploit databases.
+Application : When tasked with “Identify exploitable logic flaws in a legacy authentication mod-
+ule,” the system inspects the code, tests multiple execution paths, compares outputs with expected
+invariants, and consults CVE databases to validate its findings.
+Method :
+• Leverage code-aware LLMs to interpret software semantics and identify risky patterns across
+language boundaries.
+• Employ simulation-based probing to test exploit chains, guided by reinforcement learning
+and symbolic execution.
+• Integrate a patch synthesis module that drafts secure code replacements, referencing past
+vulnerability resolutions.
+References
+[1] Yongfeng Zhang et al. “AI Agent for Information Retrieval: Generating and Ranking”. In: Pro-
+ceedings of the 33rd ACM International Conference on Information and Knowledge Management .
+2024, pp. 5605–5607.
+[2] Junde Wu, Jiayuan Zhu, and Yuyuan Liu. “Agentic Reasoning: Reasoning LLMs with Tools for
+the Deep Research”. In: arXiv preprint arXiv:2502.04644 (2025).
+1In collaboration with prof. Domenico Amalfitano (domenico.amalfitano@unina.it)
+5
+
+================ PAGE 6 ================
+
+[3] Jakub L´ ala et al. “Paperqa: Retrieval-augmented generative agent for scientific research”. In:
+arXiv preprint arXiv:2312.07559 (2023).
+[4] Florian Schneider et al. “CollEX–A Multimodal Agentic RAG System Enabling Interactive Ex-
+ploration of Scientific Collections”. In: arXiv preprint arXiv:2504.07643 (2025).
+[5] Ruichen Zhang et al. “Toward agentic AI: generative information retrieval inspired intelligent
+communications and networking”. In: arXiv preprint arXiv:2502.16866 (2025).
+[6] Chaehong Lee et al. “Multi-Agent Geospatial Copilots for Remote Sensing Workflows”. In: arXiv
+preprint arXiv:2501.16254 (2025).
+6

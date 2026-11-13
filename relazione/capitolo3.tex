@@ -1,0 +1,202 @@
+\chapter{Metodologie di Retrieval e Ragionamento Agentico}
+\label{chap:metodologie}
+
+\section{Lo Spettro dei Paradigmi di Retrieval: Dalla RAG Lineare ai Sistemi Multi-Agente}
+\label{sec:spettro_rag}
+
+La convergenza tra Large Language Models e Information Retrieval ha dato origine a un'evoluzione progressiva delle architetture generative, comunemente classificata in quattro generazioni fondamentali \cite{gao2023modular, lewis2020retrieval}.
+
+Il punto di partenza è rappresentato dal cosiddetto Naïve RAG, basato sulla sequenza lineare elementare \textit{Retrieve $\rightarrow$ Read}. A fronte di un'interrogazione dell'utente, un motore di ricerca recupera i primi $k$ documenti da un indice statico, che vengono poi inseriti direttamente nel prompt del modello senza alcun controllo preventivo sulla loro reale pertinenza o completezza. Quando il problema si fa complesso, questo schema mostra una forte fragilità: il modello soffre di distrazione a causa di passaggi irrilevanti e finisce per generare allucinazioni su fatti indimostrati.
+
+Per porre rimedio a tali limiti è nato l'Advanced RAG, che affianca alla pipeline convenzionale moduli di pre-recupero, come la riscrittura della query, e di post-recupero, quali il re-ranking semantico e la compressione del contesto. Pur attenuando il rumore dei documenti, anche questa configurazione rimane una sequenza a senso unico: non prevede anelli di retroazione (\textit{feedback loops}) né la possibilità di riformulare la strategia qualora le informazioni estratte risultino deficitarie.
+
+Un ulteriore passo in avanti è stato compiuto con il Modular RAG, che scompone la catena in componenti indipendenti e riordinabili, introducendo selettori dedicati e sorgenti documentali multiple. L'architettura guadagna in flessibilità, ma il coordinamento tra i moduli resta vincolato a regole euristiche fisse o a classificatori deterministici cablati in partenza.
+
+L'approccio più maturo prende corpo nell'\textbf{Agentic RAG}, che supera la linearità conferendo al modello linguistico una piena autonomia operativa (\textit{agency}) \cite{zhang2024ai, wu2025agentic}. In questo contesto il modello non è un semplice trascrittore passivo, ma assume il ruolo di coordinatore centrale: esamina l'intento dell'utente, stima la complessità della domanda, formula sotto-interrogazioni mirate, sceglie e invoca in autonomia gli strumenti di ricerca opportuni e valuta criticamente le informazioni ottenute prima di emettere la sintesi finale.
+
+La Tabella~\ref{tab:confronto_paradigmi} riassume le caratteristiche strutturali e i trade-off computazionali di questi quattro paradigmi.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabularx}{\textwidth}{l p{2.8cm} p{2.8cm} X}
+\toprule
+\textbf{Paradigma} & \textbf{Flusso di Controllo} & \textbf{Gestione Complessità} & \textbf{Limiti Principali} \\
+\midrule
+\textit{Naïve RAG} & Lineare rigido (Retrieve-Read) & Inadeguato per query composite & Elevato rischio di allucinazione e sensibilità al rumore. \\
+\addlinespace[0.15cm]
+\textit{Advanced RAG} & Lineare con pre/post processing & Re-ranking su singolo step & Assenza di feedback adattivo e cicli di recupero iterativo. \\
+\addlinespace[0.15cm]
+\textit{Modular RAG} & Modulare componibile & Routing rigido a regole & Flessibilità limitata a scenari predefiniti a priori. \\
+\addlinespace[0.15cm]
+\textit{Agentic RAG} & Grafo ciclico deliberativo con feedback & Decomposizione multi-step e ReAct & Maggiore costo computazionale bilanciato da massima accuratezza. \\
+\bottomrule
+\end{tabularx}
+\caption{Confronto strutturale tra i paradigmi di Retrieval-Augmented Generation.}
+\label{tab:confronto_paradigmi}
+\end{table}
+
+\subsection{Il Ruolo dei Large Language Models e del Reinforcement Learning}
+\label{subsec:llm_reinforcement_learning}
+All'interno di un'architettura Agentic IR, il modello linguistico non si limita alla generazione testuale, ma opera come una vera e propria rete di politica decisionale $\pi_\theta(a_t \mid s_t)$.
+
+Nella letteratura scientifica, l'ottimizzazione di questa politica può seguire due strade complementari. La prima è il Reinforcement Learning, in cui l'agente viene addestrato tramite algoritmi di Policy Gradient a massimizzare una funzione di ricompensa cumulativa:
+\begin{equation}
+\mathcal{R}(s, a) = \alpha \cdot \mathcal{R}_{\text{accuracy}}(\hat{a}, a^*) + \beta \cdot \mathcal{R}_{\text{grounding}}(\hat{a}, \mathcal{C}) - \gamma \cdot \text{Cost}(a)
+\end{equation}
+Il termine $\mathcal{R}_{\text{accuracy}}$ premia la correttezza della risposta rispetto al bisogno informativo, $\mathcal{R}_{\text{grounding}}$ penalizza severamente le affermazioni prive di riscontro nel contesto $\mathcal{C}$, mentre $\text{Cost}(a)$ impone una penalità sull'invocazione superflua di strumenti, incoraggiando l'efficienza computazionale. La seconda strada, scelta nel nostro lavoro, punta sull'impiego di modelli fondazionali guidati da prompting strutturato e vincoli logici deterministici. Questo approccio evita il costo di un ri-addestramento continuo e scongiura derive linguistiche, ottenendo lo stesso comportamento prudente grazie a soglie numeriche sui cicli e schemi JSON rigorosi, con il vantaggio di una totale trasparenza e riproducibilità.
+
+\section{Routing Dinamico e Valutazione della Complessità: Adaptive-RAG}
+\label{sec:adaptive_rag}
+
+In un sistema di Information Retrieval applicato a collezioni eterogenee, trattare tutte le domande con il medesimo sforzo algoritmico risulterebbe inefficiente. Un quesito a singolo fatto non necessita di scomposizioni onerose, mentre una richiesta articolata richiede un piano strutturato.
+
+\subsection{Fondamenti Teorici di Adaptive-RAG}
+Il nostro sistema riprende i principi di \textbf{Adaptive-RAG} \cite{jeong2024adaptiverag}, impostando l'instradamento della query sulla base della complessità percepita. Data la query iniziale $q \in \mathcal{Q}$, un classificatore valuta la distribuzione di probabilità sulle classi strategiche previste, $\mathcal{C} = \{\text{Simple}, \text{Complex-MultiEntity}, \text{Complex-Bridge}\}$:
+\begin{equation}
+P(c \mid q) = \text{Softmax}\big(W_\theta \cdot \text{LLM}_{\text{embed}}(q)\big)
+\end{equation}
+
+\subsection{Implementazione del Router nel Nodo Validator}
+Nel nostro framework, il ruolo del router adattivo è affidato al nodo \textbf{Validator}, che esamina la richiesta al primo turno ($t=0$). La logica di instradamento prevede tre comportamenti ben definiti.
+
+Quando la domanda è atomica o non presenta entità in comparazione esplicita, il Validator constata che una decomposizione preventiva costituirebbe solo un ritardo ingiustificato, instradando subito il controllo verso il nodo Planner:
+\begin{equation}
+\text{Router}(q, \text{turn}=0) = \text{ROUTE\_TO\_PLANNING} \iff q \in \text{Simple}
+\end{equation}
+Al contrario, quando la richiesta mette a confronto due o più entità, il router intercetta la complessità strutturale e affida l'elaborazione al nodo Refiner per procedere alla scomposizione:
+\begin{equation}
+\text{Router}(q, \text{turn}=0) = \text{ROUTE\_TO\_REFINEMENT} \iff q \in \text{Complex-Comparative}
+\end{equation}
+Infine, per scongiurare rimbalzi ricorsivi impropri tra i nodi, non appena il Refiner ha prodotto la scomposizione atomica verificata, il Validator applica una regola di instradamento deterministica che impone il passaggio obbligato al Planner per l'esecuzione del piano.
+
+\section{Raffinamento Autonomo della Query: Decomposizione, Riscrittura ed Espansione}
+\label{sec:refiner_metodologie}
+
+Lanciare ricerche dirette a partire da interrogazioni complesse o mal formulate conduce frequentemente al fallimento dei motori di ricerca, sia a causa della distanza sintattica tra una frase ricca di dettagli e i singoli documenti nell'indice, sia per l'insufficienza di termini specifici nelle richieste telegrafiche. Per superare questa dicotomia, il nodo \textbf{Refiner} (\texttt{Refiner.py}) opera come un elaboratore specializzato dotato di tre metodologie complementari selezionate dinamicamente tramite la decisione strutturata \texttt{RefinerDecision}.
+
+\subsection{Decomposizione Strutturale con Least-to-Most Prompting}
+Per risolvere interrogazioni composite o comparative abbiamo integrato il paradigma \textbf{Least-to-Most Prompting} \cite{zhou2022leasttomost}, affiancato dalle strategie per colmare il divario composizionale nei modelli linguistici \cite{press2023measuring}. Il principio guida è la semplificazione progressiva: il problema originario viene suddiviso in una sequenza ordinata di sotto-problemi atomici, la cui risoluzione parziale fornisce le evidenze necessarie per edificare la conclusione finale:
+\begin{equation}
+\mathcal{D}(q_0) = \langle q^{(1)}, q^{(2)}, \dots, q^{(m)} \rangle
+\end{equation}
+Di fronte a quesiti che pongono a confronto attributi tra entità distinte (come \textit{``Were Scott Derrickson and Ed Wood of the same nationality?''}), il Refiner attiva la funzione \texttt{decompose\_query}, isolando due sotto-interrogazioni indipendenti, una per ciascuna entità, salvaguardando rigorosamente i nomi propri ed escludendo a priori qualsiasi perdita informativa:
+\begin{equation}
+q_0 \xrightarrow{\text{decompose\_query}} \begin{cases}
+    q^{(1)}: \text{"What is the nationality of Scott Derrickson?"} \\
+    q^{(2)}: \text{"What is the nationality of Ed Wood?"}
+\end{cases}
+\end{equation}
+
+\subsection{Riscrittura Sintattica con Rewrite-Retrieve-Read}
+Accanto alla scomposizione, il modulo incorpora la tecnica \textbf{Rewrite-Retrieve-Read} \cite{ma2023query}. Quando l'utente sottopone un quesito prolisso, colloquiale o contaminato da preamboli discorsivi, il tool \texttt{rewrite\_query} bonifica la stringa eliminando il rumore sintattico e standardizzando la struttura interrogativa:
+\begin{equation}
+q_{\text{clean}} = \text{Rewrite}(q_0)
+\end{equation}
+L'operazione è vincolata da controlli deterministici che proteggono le entità racchiuse tra virgolette, garantendo che la semplificazione stilistica non sacrifichi identificatori univoci o coordinate temporali essenziali.
+
+\subsection{Espansione Semantica con Query2doc}
+Infine, per contrastare il disallineamento lessicale nelle interrogazioni eccessivamente stringate o ambigue, il Refiner può ricorrere al paradigma \textbf{Query2doc} \cite{wang2023query2doc}. Attraverso il tool \texttt{expand\_query}, il modello linguistico sintetizza uno pseudo-documento informativo verosimile correlato al quesito, arricchendo la query di contesto semantico e sinonimi prima dell'invio al motore BM25:
+\begin{equation}
+q_{\text{expanded}} = q_0 \oplus d_{\text{pseudo}}
+\end{equation}
+Qualora invece l'interrogazione risulti già sufficientemente specifica, atomica e priva di ambiguità, il nodo invoca l'azione terminale \texttt{keep\_query\_unchanged}, inoltrandola intatta al Planner senza introdurre latenze computazionali superflue.
+
+\section{Pianificazione ed Esecuzione Multi-Hop: Il Paradigma ReAct e IRCoT}
+\label{sec:planner_react}
+
+La fase di recupero attivo sul campo è guidata dal nodo \textbf{Planner}, strutturato secondo il framework \textbf{ReAct} (\textit{Reasoning + Acting}) \cite{yao2022react} e il paradigma \textbf{IRCoT} (\textit{Interleaving Retrieval with Chain-of-Thought}) \cite{trivedi2023ircot}.
+
+\subsection{Fondamenti e Meccanica del Ciclo ReAct}
+Nei sistemi che si affidano a semplici catene di pensiero statiche, il modello ragiona su nozioni preesistenti senza poter interrogare l'ambiente esterno. Il paradigma ReAct, invece, unisce riflessioni verbali (\textit{Thoughts}) con chiamate operative a strumenti esterni (\textit{Actions}) e la successiva acquisizione dei riscontri restituiti (\textit{Observations}).
+
+Dato lo stato corrente $s_t$, a ciascun passo $t$ l'agente esegue la sequenza:
+\begin{align}
+\text{Thought}_t &= \text{LLM}_{\text{reasoning}}(s_t, q^{(j)}, \mathcal{H}_{<t}) \label{eq:react_thought} \\
+\text{Action}_t &= \text{LLM}_{\text{action}}(\text{Thought}_t) \in \mathcal{T}_{\text{tools}} \label{eq:react_action} \\
+\text{Observation}_t &= \text{ExecuteTool}(\text{Action}_t) \label{eq:react_obs}
+\end{align}
+dove $\mathcal{H}_{<t}$ tiene traccia della sequenza di pensieri, azioni e osservazioni precedenti. Il dato raccolto $\text{Observation}_t$ confluisce immediatamente nello stato dell'agente, aggiornandone la memoria per i passi successivi:
+\begin{equation}
+s_{t+1} = s_t \cup \{\text{Observation}_t\}
+\end{equation}
+
+\subsection{Orchestrazione dei Tool e Risoluzione a Catena delle Sotto-Query}
+Il Planner gestisce la risoluzione sequenziale di ciascuna sotto-query generata dal Refiner, memorizzando i risultati parziali all'interno di un registro dedicato. A seconda della modalità impostata a runtime, nella configurazione \texttt{'baseline'} l'agente può invocare unicamente \texttt{local\_kb\_search(query)}, eseguendo la ricerca BM25 sui documenti di Wikipedia memorizzati in SQLite; nella configurazione \texttt{'full'}, invece, l'agente consulta prioritariamente la base locale e, qualora riscontri un deficit informativo, attiva dinamicamente \texttt{web\_search(query)} per interrogare il Web live.
+
+Per ciascuna sotto-query $q^{(j)}$, il ciclo ReAct accumula evidenze fino all'emissione della risposta intermedia:
+\begin{equation}
+\text{intermediate\_answers}[q^{(j)}] = a^{(j)}
+\end{equation}
+Una volta risolte tutte le sotto-domande previste, il Planner passa alla sintesi finale, combinando i riscontri parziali per formulare una conclusione strettamente vincolata alle sole evidenze comprovate dai documenti.
+
+\section{Validazione Auto-Riflessiva e Mitigazione delle Allucinazioni: Self-RAG e Reflexion}
+\label{sec:self_rag}
+
+In un sistema di Information Retrieval avanzato, la risposta deve poggiare su riscontri fattuali incontrovertibili. L'adozione di meccanismi di auto-riflessione mutuati da \textbf{Self-RAG} \cite{asai2023selfrag} e di memoria verbale episodica derivata da \textbf{Reflexion} \cite{shinn2023reflexion} costituisce il nostro presidio fondamentale contro le allucinazioni.
+
+\subsection{Meccanismi di Auto-Critica e Reflection Tokens}
+Self-RAG prevede l'impiego di specifici token di controllo metacognitivo. Il token $\text{IsRel} \in \{\text{True}, \text{False}\}$ quantifica se i testi estratti siano realmente attinenti al tema della domanda, eliminando il rumore. Il token $\text{IsSup} \in \{\text{True}, \text{False}\}$ certifica se la risposta formulata sia pienamente supportata dalle sole evidenze documentali, senza aggiunte speculative. Qualora il supervisore riscontri un'inadeguatezza nei riscontri, la critica viene memorizzata nel buffer storico \texttt{feedback\_history}, guidando il Refiner e il Planner verso un'auto-correzione mirata al tentativo successivo.
+
+\subsection{Doppio Livello di Grounding nel Framework}
+Nel nostro impianto il controllo di fedeltà fattuale opera su due livelli indipendenti e coordinati. Il primo livello agisce all'interno del Planner durante la sintesi: il modello produce una spiegazione esplicita del proprio ragionamento e, se le evidenze non sono sufficienti per trarre una conclusione sicura, ha l'obbligo formale di dichiararlo apertamente. Il secondo livello agisce nel Validator, che intercetta la risposta prima del rilascio finale. Qui il supervisore valuta i token $\text{IsRel}$ e $\text{IsSup}$ e, per i quesiti polari (sì/no), verifica che il contesto contenga dati espliciti per entrambe le entità messe a confronto. Soltanto se la risposta risulta solidamente ancorata ai fatti, il Validator emette l'azione terminale \texttt{FINISH}.
+
+\section{Architettura a Grafo di Stati (LangGraph) e Garanzie di Convergenza}
+\label{sec:langgraph_convergenza}
+
+L'interazione tra i nodi non è lasciata a cicli ricorsivi privi di controllo, ma viene formalizzata come un automa a stati finiti implementato mediante la libreria \textbf{LangGraph}.
+
+\subsection{Modellazione Formale dello Stato Globale (`AgentState`)}
+Lo stato dell'agente rappresenta la memoria condivisa transazionale che transita lungo gli archi del grafo. Definito nel modulo \texttt{state.py}, esso presenta la seguente struttura:
+\begin{lstlisting}[language=Python]
+class AgentState(TypedDict):
+    original_query: str
+    current_query: str
+    retrieved_context: str
+    num_refinement: int
+    num_planning: int
+    next_node: str
+    feedback_history: List[str]
+    final_answer: str
+    sub_queries: List[str]
+    current_sub_query_idx: int
+    intermediate_answers: Dict[str, str]
+    retrieval_mode: str
+\end{lstlisting}
+
+\subsection{Topologia del Grafo e Archi Condizionali}
+La topologia del flusso è illustrata concettualmente nella Figura~\ref{fig:grafo_langgraph}. Il grafo comprende tre nodi computazionali primari ($\mathcal{V}$: Validator, $\mathcal{R}$: Refiner, $\mathcal{P}$: Planner) collegati da archi condizionali determinati dalle decisioni del supervisore:
+\begin{equation}
+\delta(s) = \begin{cases}
+    \text{route\_to\_refinement} \rightarrow \mathcal{R}, & \text{se } \text{next\_node} = \text{"ROUTE\_TO\_REFINEMENT"} \\
+    \text{route\_to\_planning} \rightarrow \mathcal{P}, & \text{se } \text{next\_node} = \text{"ROUTE\_TO\_PLANNING"} \\
+    \text{finish} \rightarrow \text{END}, & \text{se } \text{next\_node} = \text{"FINISH"}
+\end{cases}
+\end{equation}
+
+\begin{figure}[htbp]
+\centering
+\fbox{
+\begin{minipage}{0.92\textwidth}
+\centering
+\vspace{0.3cm}
+\textbf{\large Grafo di Stati Multi-Agente (LangGraph)}\\[0.3cm]
+\texttt{[START]} $\longrightarrow$ \textbf{VALIDATOR} (Adaptive-RAG Routing)\\[0.2cm]
+$\Big\downarrow$ \textit{(Conditional Edge)}\\[0.2cm]
+\begin{tabular}{c c c}
+    \textbf{REFINER} & $\longleftrightarrow$ & \textbf{PLANNER} \\
+    \textit{(Least-to-Most Decomposition)} & & \textit{(ReAct Multi-Step Retrieval)} \\
+    $\Big\downarrow$ & & $\Big\downarrow$ \\
+    \multicolumn{3}{c}{\textbf{VALIDATOR} \textit{(Self-RAG Grounding \& Polar Verification)}} \\
+\end{tabular}\\[0.2cm]
+$\Big\downarrow$ \textit{(Se validato con successo)}\\[0.2cm]
+\texttt{[END (Final Answer)]}
+\vspace{0.3cm}
+\end{minipage}
+}
+\caption{Rappresentazione concettuale del grafo di transizione degli stati tra i nodi agentici.}
+\label{fig:grafo_langgraph}
+\end{figure}
+
+\subsection{Garanzie di Terminazione e Prevenzione dei Cicli Infiniti}
+Uno dei pericoli strutturali nei grafi ciclici consiste nel rischio di oscillazioni indefinite tra nodi. Nel nostro impianto abbiamo introdotto precise garanzie di convergenza: il modulo \texttt{Validator.py} impone un tetto al numero di iterazioni consentite, fissando $\text{MAX\_REFINEMENTS} = 4$ e $\text{MAX\_PLANNINGS} = 4$. Al superamento di queste soglie, il sistema forza l'uscita verso la sintesi finale; inoltre, a livello di runtime, la chiamata a \texttt{app.stream()} applica un limite di ricorsione prudenziale (\texttt{recursion\_limit = 30}). In questo modo assicuriamo matematicamente che l'elaborazione converga sempre allo stato terminale \texttt{END} entro un numero finito di passi.

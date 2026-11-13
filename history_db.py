@@ -335,10 +335,13 @@ def seed_benchmark_runs(force_reseed: bool = False, db_path: str = DB_PATH) -> N
         conn.commit()
     conn.close()
 
-    # 1. Se presente il file benchmark_30_runs.json, caricalo prioritariamente
-    json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_30_runs.json")
-    if os.path.exists(json_path):
-        with open(json_path, "r", encoding="utf-8") as f:
+    # 1. Se presente il file benchmark_history.json o benchmark_30_runs.json, caricalo prioritariamente
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    json_path_history = os.path.join(base_dir, "benchmark_history.json")
+    json_path_30 = os.path.join(base_dir, "benchmark_30_runs.json")
+    target_json = json_path_history if os.path.exists(json_path_history) else json_path_30
+    if os.path.exists(target_json):
+        with open(target_json, "r", encoding="utf-8") as f:
             runs = json.load(f)
         for r in runs:
             log_query_run(

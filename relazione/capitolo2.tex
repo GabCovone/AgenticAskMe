@@ -1,0 +1,172 @@
+\chapter{Dati, Basi di Conoscenza e Tecniche di Preprocessing}
+\label{chap:dati_preprocessing}
+
+\section{Panoramica delle Sorgenti di Dati per l'Information Retrieval Agentico}
+\label{sec:panoramica_dati}
+
+L'efficacia e l'affidabilità di un'architettura di Information Retrieval agentica dipendono strettamente dalla qualità, dalla granularità e dalla diversità delle sorgenti di dati a cui gli agenti hanno accesso, nonché dal rigore delle procedure di preprocessing applicate sia ai testi sia alle interrogazioni. Nel panorama dell'intelligenza artificiale generativa e dei modelli linguistici, la letteratura individua due categorie primarie di collezioni documentali.
+
+Da un lato troviamo i corpora fondazionali di pre-addestramento su larga scala. Si tratta di enormi raccolte eterogenee nell'ordine delle centinaia di gigabyte o terabyte, tra cui spiccano collezioni come The Pile \cite{gao2020pile}, che raccoglie oltre 800~GB di testi distribuiti su decine di domini specialistici, dall'archivio scientifico di arXiv fino a documenti medici e codice sorgente; archivi universali a scala Web come Common Crawl, che fotografano mensilmente la varietà e il rumore del Web aperto; oppure corpora enciclopedici più curati come WikiText \cite{merity2016wikitext} e OpenWebText, caratterizzati da sintassi formale e dipendenze semantiche ampie. Sebbene questi dataset siano fondamentali per insegnare ai modelli la distribuzione statistica della lingua, essi non permettono di valutare in modo controllato la capacità di pianificare ricerche complesse a più passaggi.
+
+Dall'altro lato si collocano i benchmark specifici per il Question Answering e il Retrieval. Collezioni come MS~MARCO \cite{bajaj2016msmarco} o SQuAD \cite{rajpurkar2016squad} poggiano quasi per intero su compiti a passaggio singolo (\textit{single-hop}), in cui l'informazione risolutiva è contenuta in un unico blocco di testo. Per sollecitare le capacità di un sistema agentico serve invece un contesto differente: un terreno di prova in cui la risposta richieda un ragionamento composizionale attraverso molteplici salti logici (\textit{multi-hop reasoning}).
+
+Per soddisfare queste esigenze, il nostro lavoro adotta un benchmark per la valutazione multi-hop come \textbf{HotpotQA}, una Knowledge Base locale indicizzata con il modello probabilistico \textbf{BM25Okapi}, e uno strumento di ricerca live sul Web per garantire un recupero aperto ad ampio raggio. 
+Per la validazione sperimentale abbiamo scelto il dataset \textbf{HotpotQA} nella sua configurazione \textit{fullwiki} \cite{yang2018hotpotqa}, ritenuto concordemente lo standard di riferimento per compiti complessi di recupero e risposta a domande.
+
+\subsection{Tassonomia delle Query Multi-Hop}
+La struttura del dataset impedisce che la risposta possa essere trovata tramite una semplice ricerca diretta. Le interrogazioni si suddividono in due classi principali.
+
+Nelle \textbf{Bridge Questions}, per soddisfare il bisogno informativo è richiesta l'identificazione di un'entità intermedia nascosta che colleghi l'entità iniziale a quella cercata:
+\begin{equation}
+e_{\text{anchor}} \xrightarrow{R_1} e_{\text{bridge}} \xrightarrow{R_2} e_{\text{target}} = a_i
+\end{equation}
+
+Nelle \textbf{Comparison Questions}, la richiesta pone a confronto due entità rispetto a una determinata proprietà, richiedendo la valutazione di un predicato di uguaglianza o di confronto scalare:
+\begin{equation}
+a_i = g\big(P(e_1), P(e_2)\big), \quad g \in \{\text{EQUAL}, \text{GREATER}, \text{BOOLEAN}\}
+\end{equation}
+
+\section{Architettura e Costruzione della Knowledge Base Locale}
+\label{sec:local_kb}
+
+Per consentire al sistema di funzionare sia in configurazione \textit{Baseline} sia in configurazione \textit{Full}, abbiamo realizzato una Knowledge Base locale gestita tramite un motore probabilistico basato su \textbf{BM25Okapi} \cite{robertson2009probabilistic}.
+
+\subsection{Corpus Enciclopedico di Riferimento}
+Il corpus iniziale raccoglie un insieme selezionato di voci complete di Wikipedia, salvate nella struttura \texttt{SEED\_WIKIPEDIA\_ARTICLES} all'interno del modulo \texttt{local\_kb.py}. Abbiamo scelto argomenti che spaziano sui fondamenti dell'intelligenza artificiale e dell'informatica, su figure storiche e scientifiche, su cinema e cultura contemporanea, fino a comprendere voci geografiche e istituzionali su capitali e nazioni.
+
+\subsection{Persistenza Relazionale su SQLite}
+I documenti vengono immagazzinati in un database SQLite, il cui schema è il seguente:
+\begin{lstlisting}[language=SQL]
+CREATE TABLE IF NOT EXISTS articles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT UNIQUE NOT NULL,
+    text TEXT NOT NULL,
+    category TEXT DEFAULT 'General'
+);
+\end{lstlisting}
+L'impiego del db assicura l'integrità dei record mediante vincoli di unicità sul titolo e consente operazioni transazionali rapide per l'eventuale aggiunta dinamica di ulteriori articoli tramite la funzione \texttt{add\_article}.
+
+\subsection{Formulazione Matematica dell'Indice Probabilistico BM25Okapi}
+Per ordinare i documenti in funzione della pertinenza rispetto all'interrogazione, abbiamo impiegato l'algoritmo BM25Okapi, derivato dal paradigma probabilistico 2-Poisson. Dato un corpus $\mathcal{D} = \{D_1, \dots, D_N\}$ di $N$ documenti e una query $Q = \{q_1, \dots, q_n\}$, il punteggio di rilevanza del documento $D$ rispetto a $Q$ è espresso dalla formula:
+\begin{equation}
+\text{Score}_{\text{BM25}}(D, Q) = \sum_{i=1}^n \text{IDF}(q_i) \cdot \frac{f(q_i, D) \cdot (k_1 + 1)}{f(q_i, D) + k_1 \cdot \left(1 - b + b \cdot \frac{|D|}{\text{avgdl}}\right)}
+\end{equation}
+In questa formulazione, $f(q_i, D)$ rappresenta la frequenza del termine $q_i$ nel testo $D$, $|D|$ è la lunghezza in token del documento e $\text{avgdl} = \frac{1}{N} \sum_{D} |D|$ è la lunghezza media dei documenti dell'intera collezione. Il parametro $k_1$ regola la saturazione della frequenza dei termini (impostato sul valore standard $1.5$), mentre $b$ calibra la normalizzazione sulla lunghezza (fissato a $0.75$). Il peso $\text{IDF}(q_i)$ è calcolato secondo la correzione di Robertson per evitare valori negativi:
+\begin{equation}
+\text{IDF}(q_i) = \ln \left( \frac{N - n(q_i) + 0.5}{n(q_i) + 0.5} + 1 \right)
+\end{equation}
+dove $n(q_i)$ indica il numero di testi della collezione che contengono il termine cercato.
+
+\subsection{Serializzazione e Caching in Memoria}
+Per evitare di ricalcolare l'indice a ogni singola richiesta, l'indice invertito e il corpus pre-tokenizzato vengono serializzati su disco tramite il modulo \texttt{pickle} nei file \texttt{bm25\_index.pkl} e \texttt{corpus.pkl}. Durante il funzionamento del grafo, le funzioni \texttt{\_get\_bm25()} e \texttt{search\_index()} caricano l'indice in variabili globali di cache.
+
+\section{Integrazione di Sorgenti Dati Esterne Dinamiche: Live Web Search via Wikipedia API}
+\label{sec:web_search}
+
+Poiché una Knowledge Base locale presenta inevitabilmente una copertura limitata, il nostro sistema integra un connettore live verso il Web aperto, concretizzando il principio del \textit{Tool-Augmented Retrieval}.
+
+\subsection{Architettura del Connettore Web Esterno (Wikipedia Live API)}
+L'interazione con il Web è incapsulata all'interno della funzione \texttt{web\_search} gestita dal nodo \textbf{Planner} (\texttt{Planner.py}). Abbiamo utilizzato l'endpoint ufficiale delle \textbf{Wikipedia API} in lingua inglese (\texttt{https://en.wikipedia.org/w/api.php}), consentendo il recupero deterministico e tempestivo di pagine, estratti e sommari enciclopedici non presenti nella KB locale.
+
+L'estrazione dei dati si sviluppa lungo una sequenza ordinata di passaggi. L'API REST di Wikipedia restituisce una lista di record strutturati con titolo, identificativo di pagina ed estratto testuale:
+\begin{equation}
+R_k = \langle \text{title}_k, \text{pageid}_k, \text{extract}_k \rangle
+\end{equation}
+I testi estratti vengono bonificati da markup wiki residuo, formattazioni speciali e interruzioni spurie. I passaggi più rilevanti (fino a $k=3$ riscontri) vengono formattati in una stringa contestuale strutturata che conserva la provenienza del documento:
+\begin{equation}
+C_{\text{web}} = \bigcup_{k=1}^K \big[ \text{Titolo: } \text{title}_k \mid \text{Summary: } \text{extract}_k \big]
+\end{equation}
+Tra chiamate di rete successive viene introdotto un intervallo prudenziale di controllo. Qualora la voce ricercata non sia presente o si verifichi un timeout di rete, il modulo restituisce una segnalazione esplicita di assenza dati, permettendo al ciclo ReAct di formulare un'ipotesi alternativa o di tentare una riformulazione della query senza interrompere l'esecuzione del grafo.
+
+\section{Pipeline di Preprocessing e Metriche di Valutazione per il Question Answering}
+\label{sec:preprocessing_metriche}
+
+Il confronto tra la risposta generata dall'agente ($\hat{a}$) e la Gold Answer di riferimento ($a^*$) esige un protocollo di normalizzazione deterministico, capace di eliminare discrepanze superficiali senza intaccare il contenuto semantico.
+
+\subsection{Algoritmo di Normalizzazione Testuale Standard}
+In linea con gli standard definiti per HotpotQA e SQuAD \cite{rajpurkar2016squad, yang2018hotpotqa}, applichiamo una funzione di normalizzazione canonica $\phi: \Sigma^* \rightarrow \Sigma^*$:
+\begin{equation}
+\phi(T) = \text{WhiteSpaceFix}\Big(\text{RemoveArticles}\big(\text{RemovePunctuation}(\text{LowerCase}(T))\big)\Big)
+\end{equation}
+Tale trasformazione è implementata nel modulo \texttt{history\_db.py} come segue:
+\begin{lstlisting}[language=Python]
+def normalize_qa_text(s: str) -> str:
+    def remove_articles(text):
+        return re.sub(r'\b(a|an|the)\b', ' ', text)
+    def white_space_fix(text):
+        return ' '.join(text.split())
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return ''.join(ch for ch in text if ch not in exclude)
+    return white_space_fix(remove_articles(remove_punc(s.lower())))
+\end{lstlisting}
+
+\subsection{Formulazione Matematica delle Metriche di Information Retrieval}
+Dati la risposta predetta $\hat{a}$ e il riferimento $a^*$, consideriamo i rispettivi multiset di token normalizzati $\mathcal{T}_P = \text{tokens}(\phi(\hat{a}))$ e $\mathcal{T}_G = \text{tokens}(\phi(a^*))$. Il calcolo delle grandezze si suddivide in base alla tipologia di quesito.
+
+Nelle risposte polari booleane (\textit{yes/no}), se il riferimento normalizzato appartiene a $\{ \text{"yes"}, \text{"no"} \}$, imponiamo un criterio di mutua esclusione. Sia $\text{opp} = \text{"no"}$ se $a^* = \text{"yes"}$, oppure $\text{"yes"}$ se $a^* = \text{"no"}$. Il riscontro è considerato valido se e soltanto se il token atteso è presente nella risposta e il token opposto ne è assente:
+\begin{equation}
+\text{Match}_{\text{polar}} = {I}\big( (a^* \in \mathcal{T}_P) \land (\text{opp} \notin \mathcal{T}_P) \big)
+\end{equation}
+In questo caso, Precision, Recall, F1 ed Exact Match assumono concordemente valore $1.0$ se la condizione è soddisfatta, e $0.0$ in caso contrario.
+
+Per tutte le altre risposte, calcoliamo l'intersezione tra i token generati e quelli attesi, $\mathcal{T}_{\text{same}} = \mathcal{T}_P \cap \mathcal{T}_G$, tenendo conto delle rispettive frequenze minime:
+\begin{align}
+\text{Precision} &= \frac{|\mathcal{T}_{\text{same}}|}{|\mathcal{T}_P|} = \frac{\sum_{w} \min(c(w, \mathcal{T}_P), c(w, \mathcal{T}_G))}{\sum_{w} c(w, \mathcal{T}_P)} \\[0.2cm]
+\text{Recall} &= \frac{|\mathcal{T}_{\text{same}}|}{|\mathcal{T}_G|} = \frac{\sum_{w} \min(c(w, \mathcal{T}_P), c(w, \mathcal{T}_G))}{\sum_{w} c(w, \mathcal{T}_G)} \\[0.2cm]
+\text{F1-Score} &= \begin{cases}
+    \dfrac{2 \cdot \text{Precision} \cdot \text{Recall}}{\text{Precision} + \text{Recall}}, & \text{se } \text{Precision} + \text{Recall} > 0 \\
+    0.0, & \text{altrimenti}
+\end{cases}
+\end{align}
+
+Per quanto riguarda l'Exact Match (EM), la formulazione rigida verifica la perfetta uguaglianza binaria:
+\begin{equation}
+\text{EM}_{\text{strict}} = {I}\big(\phi(\hat{a}) = \phi(a^*)\big)
+\end{equation}
+Considerata la tendenza naturale dei modelli generativi a formulare risposte in forma di proposizione completa, il sistema ammette anche il contenimento esatto tramite confini di parola (\textit{regex boundary match}):
+\begin{equation}
+\text{EM} = {I}\Big(\big(\phi(\hat{a}) = \phi(a^*)\big) \lor \big(\text{RegexMatch}(\phi(a^*), \phi(\hat{a}))\big)\Big)
+\end{equation}
+Una risposta viene infine classificata come corretta (\textbf{Grounded Accuracy}) quando rispetta la condizione di Exact Match oppure ottiene un F1-Score a livello di token pari o superiore al $50\%$.
+
+\section{Persistenza e Tracciamento dei Dati Sperimentali: Schema del Database `agentic\_history.db`}
+\label{sec:schema_db}
+
+Per garantire piena tracciabilità e permettere un confronto statistico tra esecuzioni successive, abbiamo predisposto un database SQLite dedicato (\texttt{agentic\_history.db}), gestito dal modulo \texttt{history\_db.py}.
+
+Tutte le sessioni di esecuzione del grafo vengono memorizzate nella tabella \texttt{query\_runs}, il cui schema relazionale completo è riportato nella Tabella~\ref{tab:schema_query_runs}.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabularx}{\textwidth}{l p{3.2cm} X}
+\toprule
+\textbf{Colonna} & \textbf{Tipo SQL} & \textbf{Descrizione e Ruolo nel Framework} \\
+\midrule
+\texttt{id} & \texttt{INTEGER PRIMARY KEY} & Identificativo progressivo autoincrementale univoco per evitare collisioni tra esecuzioni. \\
+\texttt{timestamp} & \texttt{DATETIME} & Marca temporale UTC di completamento del ciclo agentico. \\
+\texttt{query} & \texttt{TEXT NOT NULL} & Interrogazione originaria sottoposta dall'utente o dal benchmark. \\
+\texttt{gold\_answer} & \texttt{TEXT} & Risposta certificata di riferimento (se disponibile nel benchmark). \\
+\texttt{final\_answer} & \texttt{TEXT} & Risposta finale sintetizzata dal nodo Planner e validata dal grafo. \\
+\texttt{is\_correct} & \texttt{BOOLEAN} & Esito binario di Grounded Accuracy (1 = Corretta, 0 = Errata). \\
+\texttt{accuracy} & \texttt{REAL} & Valore numerico di accuratezza ($1.0$ per match valido, $0.0$ per mismatch). \\
+\texttt{f1\_score} & \texttt{REAL} & Macro F1-Score a livello di token calcolato rispetto alla Gold Answer. \\
+\texttt{precision} & \texttt{REAL} & Precisione media sui token estratti rispetto alla risposta esatta. \\
+\texttt{recall} & \texttt{REAL} & Richiamo medio sui token della risposta esatta presenti nell'output. \\
+\texttt{exact\_match} & \texttt{REAL} & Indicatore di Exact Match ($1.0$ per corrispondenza identica o contenimento). \\
+\texttt{num\_refinement} & \texttt{INTEGER} & Numero di iterazioni eseguite attraverso il nodo \textit{Refiner}. \\
+\texttt{num\_planning} & \texttt{INTEGER} & Numero di hop ReAct e chiamate a tool eseguiti nel nodo \textit{Planner}. \\
+\texttt{steps\_trace} & \texttt{TEXT (JSON)} & Sequenza cronologica strutturata dei nodi visitati e delle transizioni. \\
+\texttt{reasoning} & \texttt{TEXT} & Log integrale del processo di pensiero generato dall'LLM (\textit{Thoughts}). \\
+\texttt{retrieved\_context} & \texttt{TEXT} & Insieme delle evidenze fattuali raccolte dai tool di recupero. \\
+\texttt{feedback\_history} & \texttt{TEXT (JSON)} & Cronologia delle critiche e dei feedback generati dal nodo \textit{Validator}. \\
+\texttt{execution\_time\_sec} & \texttt{REAL} & Tempo totale impiegato dall'agente per completare l'elaborazione. \\
+\texttt{system\_mode} & \texttt{TEXT DEFAULT 'full'} & Modalità di esecuzione: \texttt{'full'} (Sistema Integrale) o \texttt{'baseline'} (Solo KB Locale). \\
+\bottomrule
+\end{tabularx}
+\caption{Schema relazionale della tabella \texttt{query\_runs} all'interno del database \texttt{agentic\_history.db}.}
+\label{tab:schema_query_runs}
+\end{table}
+
+La presenza del campo \texttt{system\_mode} assicura un isolamento tra le modalità operative. Questa separazione consente alla dashboard di confrontare istantaneamente le metriche aggregate senza generare ambiguità nei record o sovrascritture di dati.
